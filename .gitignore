@@ -1,0 +1,42 @@
+# JavaScript
+node_modules/
+dist/
+*.tsbuildinfo
+pnpm-debug.log*
+npm-debug.log*
+yarn-error.log*
+
+# Generated extension assets
+apps/extension/bin/
+apps/extension/media/webview/
+apps/extension/.module-cache/
+
+# Python
+.venv/
+.tools/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+
+# Sentia runtime
+.sentia/
+*.db
+*.db-shm
+*.db-wal
+
+# Editor and operating system
+.DS_Store
+.idea/
+.vscode-test/
+*.vsix
+
+# Secrets
+.env
+.env.*
+!.env.example

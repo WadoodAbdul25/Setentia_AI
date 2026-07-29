@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleIdentifier</key>
+  <string>ai.sentia.microphone</string>
+  <key>CFBundleName</key>
+  <string>Sentia Microphone</string>
+  <key>CFBundleDisplayName</key>
+  <string>Sentia Microphone</string>
+  <key>NSMicrophoneUsageDescription</key>
+  <string>Sentia uses the microphone to transcribe voice requests about your codebase.</string>
+</dict>
+</plist>

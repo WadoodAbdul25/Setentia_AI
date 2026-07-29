@@ -1,0 +1,9 @@
+.tools/
+.venv/
+**/dist/
+apps/extension/media/webview/
+**/node_modules/
+*.tsbuildinfo
+pnpm-lock.yaml
+uv.lock
+

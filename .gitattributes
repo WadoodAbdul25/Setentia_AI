@@ -1,0 +1,6 @@
+* text=auto eol=lf
+
+*.m text eol=lf
+*.plist text eol=lf
+*.svg text eol=lf
+*.lock text eol=lf

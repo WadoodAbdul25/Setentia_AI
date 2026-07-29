@@ -1,0 +1,36 @@
+{
+  "name": "sentia",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Editor-native AI agent layer that brings a codebase to life.",
+  "packageManager": "pnpm@10.15.1",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "npm run build:protocol && npm run build:editor-client && npm run build:webview && npm run build:extension",
+    "build:protocol": "npm --prefix packages/protocol run build",
+    "build:editor-client": "npm --prefix packages/editor-client run build",
+    "build:webview": "npm --prefix apps/webview run build",
+    "build:extension": "npm --prefix apps/extension run build",
+    "dev": "concurrently -k -n protocol,webview,extension,sidecar -c blue,magenta,cyan,green \"npm --prefix packages/protocol run dev\" \"npm --prefix apps/webview run dev\" \"npm --prefix apps/extension run dev\" \".venv/bin/sentia-sidecar\"",
+    "format": "prettier --write . && .venv/bin/ruff format .",
+    "format:check": "prettier --check . && .venv/bin/ruff format --check .",
+    "lint": "npm run build:protocol && eslint apps packages && .venv/bin/ruff check .",
+    "typecheck": "npm --prefix packages/protocol run typecheck && npm --prefix packages/editor-client run typecheck && npm --prefix apps/webview run typecheck && npm --prefix apps/extension run typecheck && .venv/bin/mypy apps/sidecar/src",
+    "test": "npm run test:js && npm run test:py",
+    "test:js": "npm --prefix packages/protocol test && npm --prefix apps/webview test && npm --prefix apps/extension test",
+    "test:py": ".venv/bin/pytest",
+    "verify": "npm run format:check && npm run lint && npm run typecheck && npm run test && npm run build"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.34.0",
+    "concurrently": "^9.2.1",
+    "eslint": "^9.34.0",
+    "eslint-plugin-react-hooks": "^5.2.0",
+    "globals": "^16.3.0",
+    "prettier": "^3.6.2",
+    "typescript": "^5.9.2",
+    "typescript-eslint": "^8.41.0"
+  }
+}

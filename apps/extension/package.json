@@ -1,0 +1,141 @@
+{
+  "name": "@sentia/extension",
+  "displayName": "Sentia",
+  "description": "Bring your codebase to life.",
+  "version": "0.1.0",
+  "private": true,
+  "publisher": "sentia-local",
+  "license": "UNLICENSED",
+  "engines": {
+    "vscode": "^1.100.0"
+  },
+  "categories": [
+    "Other",
+    "Machine Learning"
+  ],
+  "keywords": [
+    "ai",
+    "codebase",
+    "voice",
+    "claude"
+  ],
+  "activationEvents": [
+    "onStartupFinished",
+    "onView:sentia.sidebar",
+    "onCommand:sentia.open",
+    "onCommand:sentia.connectAnthropic",
+    "onCommand:sentia.disconnectAnthropic",
+    "onCommand:sentia.restartSidecar",
+    "onCommand:sentia.openDiagnostics"
+  ],
+  "main": "./dist/extension.js",
+  "files": [
+    "bin",
+    "dist",
+    "media",
+    "package.json",
+    "README.md"
+  ],
+  "contributes": {
+    "commands": [
+      {
+        "command": "sentia.open",
+        "title": "Sentia: Open"
+      },
+      {
+        "command": "sentia.restartSidecar",
+        "title": "Sentia: Restart Local Sidecar"
+      },
+      {
+        "command": "sentia.openDiagnostics",
+        "title": "Sentia: Open Diagnostics"
+      },
+      {
+        "command": "sentia.connectAnthropic",
+        "title": "Sentia: Connect Anthropic"
+      },
+      {
+        "command": "sentia.disconnectAnthropic",
+        "title": "Sentia: Disconnect Anthropic"
+      }
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "sentia",
+          "title": "Sentia",
+          "icon": "media/sentia.svg"
+        }
+      ]
+    },
+    "views": {
+      "sentia": [
+        {
+          "type": "webview",
+          "id": "sentia.sidebar",
+          "name": "Sentia"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "Sentia",
+      "properties": {
+        "sentia.development.sidecarExecutable": {
+          "type": "string",
+          "default": "",
+          "scope": "machine",
+          "description": "Development-only path to a Sentia sidecar executable. Leave empty in packaged builds."
+        },
+        "sentia.voice.deepgramModel": {
+          "type": "string",
+          "enum": [
+            "flux-general-en",
+            "flux-general-multi"
+          ],
+          "default": "flux-general-en",
+          "description": "Deepgram Flux speech recognition model."
+        },
+        "sentia.voice.languageHints": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "description": "Language hints used only with flux-general-multi, for example en and es."
+        },
+        "sentia.voice.deepgramEndpoint": {
+          "type": "string",
+          "default": "wss://api.deepgram.com",
+          "scope": "machine",
+          "description": "Deepgram WebSocket origin. Use wss://api.eu.deepgram.com, wss://api.au.deepgram.com, or a dedicated endpoint when required. Sentia always connects through /v2/listen."
+        },
+        "sentia.voice.deepgramTtsModel": {
+          "type": "string",
+          "default": "flux-marcus-en",
+          "description": "Deepgram Flux TTS voice model used for natural spoken answers."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "build": "node scripts/build-native.mjs && node esbuild.mjs",
+    "dev": "node scripts/build-native.mjs && node esbuild.mjs --watch",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run --passWithNoTests",
+    "package": "vsce package --no-dependencies"
+  },
+  "dependencies": {
+    "@sentia/protocol": "workspace:*",
+    "ws": "^8.18.3"
+  },
+  "devDependencies": {
+    "@types/node": "^24.3.0",
+    "@types/vscode": "^1.100.0",
+    "@types/ws": "^8.18.1",
+    "@vscode/test-cli": "^0.0.11",
+    "@vscode/test-electron": "^2.5.2",
+    "@vscode/vsce": "^3.6.0",
+    "esbuild": "^0.25.9",
+    "vitest": "^3.2.4"
+  }
+}
