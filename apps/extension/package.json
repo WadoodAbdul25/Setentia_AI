@@ -111,8 +111,60 @@
         },
         "sentia.voice.deepgramTtsModel": {
           "type": "string",
-          "default": "flux-marcus-en",
-          "description": "Deepgram Flux TTS voice model used for natural spoken answers."
+          "default": "flux-bruce-en",
+          "description": "Deepgram TTS voice model. Use a flux-* model for conversational context or an aura-2-* model when explicit speed control is required."
+        },
+        "sentia.voice.deepgramTtsSpeed": {
+          "type": "number",
+          "default": 1,
+          "minimum": 0.7,
+          "maximum": 1.5,
+          "description": "Speaking-rate multiplier for Aura-2 TTS. Flux TTS ignores this setting because runtime speed control is not yet available."
+        },
+        "sentia.voice.openaiTranscriptionModel": {
+          "type": "string",
+          "enum": [
+            "gpt-live-transcribe"
+          ],
+          "default": "gpt-live-transcribe",
+          "description": "OpenAI model used for live voice transcription."
+        },
+        "sentia.voice.openaiRealtimeEndpoint": {
+          "type": "string",
+          "default": "wss://api.openai.com/v1/realtime?model=gpt-realtime",
+          "scope": "machine",
+          "description": "OpenAI Realtime WebSocket endpoint. Sentia uses the gpt-realtime session transport with gpt-live-transcribe for live input transcription."
+        },
+        "sentia.voice.openaiEndpoint": {
+          "type": "string",
+          "default": "https://api.openai.com",
+          "scope": "machine",
+          "description": "OpenAI HTTP origin used for speech generation."
+        },
+        "sentia.voice.openaiTtsModel": {
+          "type": "string",
+          "default": "gpt-4o-mini-tts",
+          "description": "OpenAI text-to-speech model used for spoken answers."
+        },
+        "sentia.voice.openaiVoice": {
+          "type": "string",
+          "enum": [
+            "alloy",
+            "ash",
+            "ballad",
+            "coral",
+            "echo",
+            "fable",
+            "nova",
+            "onyx",
+            "sage",
+            "shimmer",
+            "verse",
+            "marin",
+            "cedar"
+          ],
+          "default": "marin",
+          "description": "Built-in OpenAI voice used for AI-generated speech."
         }
       }
     }

@@ -34,6 +34,11 @@ describe("Sentia webview store", () => {
         connected: true,
         message: null,
       },
+      openaiVoice: {
+        connected: false,
+        message: null,
+      },
+      voiceProvider: "deepgram",
       sidecar: {
         status: "healthy",
         workflowState: "ready",

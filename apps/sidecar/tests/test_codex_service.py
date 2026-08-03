@@ -127,6 +127,63 @@ async def test_codex_service_reuses_one_client_for_bounded_structured_turns(
     assert validated[1]["answer_elapsed_ms"] >= 0
 
 
+async def test_codex_speech_stream_yields_agent_message_deltas(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    calls: list[dict[str, Any]] = []
+
+    class FakeTurn:
+        async def stream(self) -> Any:
+            yield SimpleNamespace(
+                method="item/agentMessage/delta",
+                payload=SimpleNamespace(delta="First idea. "),
+            )
+            yield SimpleNamespace(
+                method="item/agentMessage/delta",
+                payload=SimpleNamespace(delta="Second idea."),
+            )
+            yield SimpleNamespace(
+                method="turn/completed",
+                payload=SimpleNamespace(
+                    turn=SimpleNamespace(status=SimpleNamespace(value="completed"))
+                ),
+            )
+
+        async def interrupt(self) -> None:
+            calls.append({"kind": "interrupt"})
+
+    class FakeThread:
+        async def turn(self, prompt: str, **kwargs: Any) -> FakeTurn:
+            calls.append({"kind": "turn", "prompt": prompt, **kwargs})
+            return FakeTurn()
+
+    class FakeCodex:
+        def __init__(self, config: Any) -> None:
+            calls.append({"kind": "client", "config": config})
+
+        async def __aenter__(self) -> FakeCodex:
+            return self
+
+        async def close(self) -> None:
+            return None
+
+        async def thread_start(self, **kwargs: Any) -> FakeThread:
+            calls.append({"kind": "thread", **kwargs})
+            return FakeThread()
+
+    monkeypatch.setattr(service_module, "AsyncCodex", FakeCodex)
+    service = CodexRepositoryService("codex-test")
+
+    deltas = [delta async for delta in service.stream_speech("Display answer.", tmp_path)]
+    await service.close()
+
+    assert deltas == ["First idea. ", "Second idea."]
+    turn_call = next(call for call in calls if call["kind"] == "turn")
+    assert "Return only the spoken narration as plain text" in turn_call["prompt"]
+    assert "output_schema" not in turn_call
+
+
 def _turn_result(text: str, *, input_tokens: int, output_tokens: int) -> Any:
     usage = SimpleNamespace(
         last=SimpleNamespace(

@@ -57,6 +57,22 @@ def test_health_reports_protocol(client: TestClient, auth_headers: dict[str, str
     assert response.json()["workflowState"] == "ready"
 
 
+def test_openai_voice_credentials_stay_in_sidecar_memory(
+    client: TestClient, auth_headers: dict[str, str]
+) -> None:
+    connected = client.put(
+        "/api/v1/auth/openai-voice",
+        headers=auth_headers,
+        json={"apiKey": "openai-test-key-long-enough"},  # pragma: allowlist secret
+    )
+    status = client.get("/api/v1/auth/openai-voice", headers=auth_headers)
+    disconnected = client.delete("/api/v1/auth/openai-voice", headers=auth_headers)
+
+    assert connected.json()["connected"] is True
+    assert status.json()["connected"] is True
+    assert disconnected.json()["connected"] is False
+
+
 def test_agent_connection_status_is_provider_specific(
     settings: Settings, auth_headers: dict[str, str]
 ) -> None:
@@ -281,7 +297,25 @@ def test_speech_render_uses_the_exact_display_answer(
                 "provider": "codex",
             },
         )
+        streamed = test_client.post(
+            "/api/v1/voice/render/stream",
+            headers=auth_headers,
+            json={
+                "workspacePath": str(tmp_path),
+                "answer": display_answer,
+                "provider": "codex",
+            },
+        )
 
     assert response.status_code == 200
     assert response.json() == {"spokenAnswer": "Codex inspected the fixture in spoken form."}
-    assert codex.speech_requests == [(display_answer, tmp_path)]
+    assert streamed.status_code == 200
+    assert streamed.headers["content-type"].startswith("application/x-ndjson")
+    assert streamed.text.splitlines() == [
+        '{"type": "delta", "text": "Codex inspected the fixture in spoken form."}',
+        '{"type":"done"}',
+    ]
+    assert codex.speech_requests == [
+        (display_answer, tmp_path),
+        (display_answer, tmp_path),
+    ]

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import base64
 import json
 import re
 from collections.abc import AsyncIterator
@@ -10,10 +12,13 @@ from typing import Any, Protocol
 from urllib.parse import urlencode, urlsplit, urlunsplit
 
 from websockets.asyncio.client import ClientConnection, connect
+from websockets.exceptions import ConnectionClosed
 
 from sentia_sidecar.repository import RepositoryManifest
 
 FLUX_MODELS = {"flux-general-en", "flux-general-multi"}
+OPENAI_TRANSCRIPTION_MODELS = {"gpt-live-transcribe"}
+OPENAI_REALTIME_MODEL = "gpt-realtime"
 FLUX_EVENTS = {"StartOfTurn", "Update", "EagerEndOfTurn", "TurnResumed", "EndOfTurn"}
 SUPPORTED_ENDPOINT_SCHEMES = {"ws", "wss", "http", "https"}
 MAX_KEYTERMS = 100
@@ -67,6 +72,19 @@ class VoiceOptions:
             raise VoiceError(f"Unsupported voice encoding: {self.encoding}")
         if self.sample_rate is not None and self.sample_rate <= 0:
             raise VoiceError("sample_rate must be positive")
+
+
+@dataclass(frozen=True)
+class OpenAIVoiceOptions:
+    model: str = "gpt-live-transcribe"
+    endpoint: str = "wss://api.openai.com/v1/realtime?model=gpt-realtime"
+    sample_rate: int = 24_000
+
+    def __post_init__(self) -> None:
+        if self.model not in OPENAI_TRANSCRIPTION_MODELS:
+            raise VoiceError(f"Unsupported OpenAI transcription model: {self.model}")
+        if self.sample_rate != 24_000:
+            raise VoiceError("OpenAI live transcription requires 24 kHz PCM audio")
 
 
 @dataclass(frozen=True)
@@ -273,6 +291,25 @@ def build_flux_url(options: VoiceOptions) -> str:
     return urlunsplit((scheme, parsed.netloc, path, urlencode(query), ""))
 
 
+def build_openai_realtime_url(options: OpenAIVoiceOptions) -> str:
+    endpoint = options.endpoint.strip().rstrip("/")
+    parsed = urlsplit(endpoint)
+    if parsed.scheme not in SUPPORTED_ENDPOINT_SCHEMES or not parsed.netloc:
+        raise VoiceError("OpenAI endpoint must be an absolute ws:// or wss:// URL")
+    scheme = {"http": "ws", "https": "wss"}.get(parsed.scheme, parsed.scheme)
+    base_path = parsed.path.rstrip("/")
+    path = base_path if base_path.endswith("/v1/realtime") else f"{base_path}/v1/realtime"
+    return urlunsplit(
+        (
+            scheme,
+            parsed.netloc,
+            path,
+            urlencode({"model": OPENAI_REALTIME_MODEL}),
+            "",
+        )
+    )
+
+
 class FluxConnection(Protocol):
     async def send_audio(self, audio: bytes) -> None: ...
 
@@ -288,6 +325,15 @@ class FluxGateway(Protocol):
         self,
         api_key: str,
         options: VoiceOptions,
+        keyterms: tuple[str, ...],
+    ) -> FluxConnection: ...
+
+
+class OpenAIVoiceGateway(Protocol):
+    async def connect(
+        self,
+        api_key: str,
+        options: OpenAIVoiceOptions,
         keyterms: tuple[str, ...],
     ) -> FluxConnection: ...
 
@@ -350,5 +396,205 @@ class DeepgramFluxGateway:
         except Exception as error:
             raise VoiceError(f"Could not connect to Deepgram Flux: {error}") from error
         connection = DeepgramFluxConnection(socket)
+        await connection.configure(options, keyterms)
+        return connection
+
+
+class OpenAIRealtimeTranscriptionConnection:
+    def __init__(self, socket: ClientConnection) -> None:
+        self.socket = socket
+        self.transcripts: dict[str, str] = {}
+        self.turns: dict[str, int] = {}
+        self.closing = False
+        self.finish_requested = False
+
+    async def configure(
+        self,
+        options: OpenAIVoiceOptions,
+        keyterms: tuple[str, ...],
+    ) -> None:
+        transcription: dict[str, Any] = {"model": options.model, "delay": "low"}
+        selected = [
+            term.strip()
+            for term in keyterms
+            if term.strip()
+            and len(term.strip()) <= 100
+            and not any(character in term for character in ("<", ">", "\r", "\n"))
+        ][:MAX_KEYTERMS]
+        if selected:
+            transcription["keywords"] = selected
+        await self.socket.send(
+            json.dumps(
+                {
+                    "type": "session.update",
+                    "session": {
+                        "type": "realtime",
+                        "model": OPENAI_REALTIME_MODEL,
+                        "output_modalities": ["text"],
+                        "audio": {
+                            "input": {
+                                "format": {
+                                    "type": "audio/pcm",
+                                    "rate": options.sample_rate,
+                                },
+                                "transcription": transcription,
+                                "turn_detection": None,
+                            }
+                        },
+                    },
+                }
+            )
+        )
+        try:
+            async with asyncio.timeout(10):
+                while True:
+                    raw = await self.socket.recv()
+                    if not isinstance(raw, str):
+                        continue
+                    try:
+                        payload = json.loads(raw)
+                    except json.JSONDecodeError:
+                        continue
+                    if not isinstance(payload, dict):
+                        continue
+                    if payload.get("type") == "session.updated":
+                        return
+                    if payload.get("type") == "error":
+                        error = payload.get("error")
+                        description = error.get("message") if isinstance(error, dict) else None
+                        code = error.get("code") if isinstance(error, dict) else None
+                        detail = (
+                            description
+                            if isinstance(description, str)
+                            else "OpenAI rejected the transcription session."
+                        )
+                        if isinstance(code, str) and code:
+                            detail = f"OpenAI transcription error ({code}): {detail}"
+                        raise VoiceError(detail)
+        except TimeoutError as error:
+            raise VoiceError(
+                "OpenAI did not confirm the transcription session within 10 seconds."
+            ) from error
+        except ConnectionClosed as error:
+            raise VoiceError(
+                f"OpenAI closed the transcription session during setup: {error}"
+            ) from error
+
+    async def send_audio(self, audio: bytes) -> None:
+        try:
+            await self.socket.send(
+                json.dumps(
+                    {
+                        "type": "input_audio_buffer.append",
+                        "audio": base64.b64encode(audio).decode("ascii"),
+                    }
+                )
+            )
+        except ConnectionClosed as error:
+            raise VoiceError(f"OpenAI voice connection closed: {error}") from error
+
+    async def close_stream(self) -> None:
+        self.finish_requested = True
+        try:
+            await self.socket.send(json.dumps({"type": "input_audio_buffer.commit"}))
+        except ConnectionClosed as error:
+            raise VoiceError(f"OpenAI voice connection closed: {error}") from error
+
+    async def close(self) -> None:
+        self.closing = True
+        await self.socket.close()
+
+    def _turn_index(self, item_id: str) -> int:
+        if item_id not in self.turns:
+            self.turns[item_id] = len(self.turns)
+        return self.turns[item_id]
+
+    async def messages(self) -> AsyncIterator[dict[str, Any]]:
+        try:
+            async for raw in self.socket:
+                if not isinstance(raw, str):
+                    continue
+                try:
+                    payload = json.loads(raw)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(payload, dict):
+                    continue
+                message_type = payload.get("type")
+                if message_type == "error":
+                    error = payload.get("error")
+                    description = error.get("message") if isinstance(error, dict) else None
+                    code = error.get("code") if isinstance(error, dict) else None
+                    detail = (
+                        description
+                        if isinstance(description, str)
+                        else "OpenAI live transcription returned an error."
+                    )
+                    if isinstance(code, str) and code:
+                        detail = f"OpenAI transcription error ({code}): {detail}"
+                    yield {"type": "Error", "description": detail}
+                    return
+                if message_type not in {
+                    "conversation.item.input_audio_transcription.delta",
+                    "conversation.item.input_audio_transcription.completed",
+                }:
+                    continue
+                item_id = payload.get("item_id")
+                if not isinstance(item_id, str):
+                    item_id = f"turn-{len(self.turns)}"
+                if message_type.endswith(".delta"):
+                    delta = payload.get("delta")
+                    if not isinstance(delta, str):
+                        continue
+                    transcript = self.transcripts.get(item_id, "") + delta
+                    self.transcripts[item_id] = transcript
+                    event = "Update"
+                else:
+                    completed_transcript = payload.get("transcript")
+                    transcript = (
+                        completed_transcript
+                        if isinstance(completed_transcript, str)
+                        else self.transcripts.get(item_id, "")
+                    )
+                    self.transcripts[item_id] = transcript
+                    event = "EndOfTurn"
+                yield {
+                    "type": "TurnInfo",
+                    "event": event,
+                    "turn_index": self._turn_index(item_id),
+                    "transcript": transcript,
+                    "end_of_turn_confidence": None,
+                    "languages": [],
+                }
+                if event == "EndOfTurn" and self.finish_requested:
+                    self.closing = True
+                    await self.socket.close()
+                    return
+        except ConnectionClosed as error:
+            if not self.closing:
+                yield {
+                    "type": "Error",
+                    "description": f"OpenAI voice connection closed: {error}",
+                }
+
+
+class OpenAIRealtimeTranscriptionGateway:
+    async def connect(
+        self,
+        api_key: str,
+        options: OpenAIVoiceOptions,
+        keyterms: tuple[str, ...],
+    ) -> FluxConnection:
+        try:
+            socket = await connect(
+                build_openai_realtime_url(options),
+                additional_headers={"Authorization": f"Bearer {api_key}"},
+                open_timeout=10,
+                close_timeout=5,
+                max_size=2**20,
+            )
+        except Exception as error:
+            raise VoiceError(f"Could not connect to OpenAI voice transcription: {error}") from error
+        connection = OpenAIRealtimeTranscriptionConnection(socket)
         await connection.configure(options, keyterms)
         return connection

@@ -113,6 +113,15 @@ class DeepgramCredentialStatus(CamelModel):
     message: str | None = None
 
 
+class OpenAIVoiceCredentialSet(CamelModel):
+    api_key: SecretStr = Field(min_length=20)
+
+
+class OpenAIVoiceCredentialStatus(CamelModel):
+    connected: bool
+    message: str | None = None
+
+
 class AgentConnectionStatus(CamelModel):
     provider: AgentProvider
     connected: bool

@@ -23,6 +23,10 @@ bridge.subscribe((raw) => {
     useSentiaStore.getState().setAnthropic(message.payload);
   } else if (message.type === "deepgram.status") {
     useSentiaStore.getState().setDeepgram(message.payload);
+  } else if (message.type === "openai_voice.status") {
+    useSentiaStore.getState().setOpenAIVoice(message.payload);
+  } else if (message.type === "voice.provider.status") {
+    useSentiaStore.getState().setVoiceProvider(message.payload);
   } else if (message.type === "agent.status") {
     useSentiaStore.getState().setAgent(message.payload);
   } else if (message.type === "sidecar.event") {

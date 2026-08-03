@@ -7,7 +7,7 @@ from typing import Any
 import httpx
 import pytest
 import respx
-from claude_agent_sdk import ClaudeAgentOptions, ResultMessage
+from claude_agent_sdk import ClaudeAgentOptions, ResultMessage, StreamEvent
 from sentia_sidecar.anthropic_service import (
     READ_TOOL,
     SEARCH_TOOL,
@@ -146,6 +146,40 @@ async def test_answer_uses_read_only_agent_sdk_and_cached_snapshot(tmp_path: Pat
     assert validated["turns"] == 3
     assert validated["agent_elapsed_ms"] >= 0
     assert validated["total_elapsed_ms"] >= 0
+
+
+async def test_anthropic_speech_stream_yields_partial_text(tmp_path: Path) -> None:
+    calls: list[ClaudeAgentOptions] = []
+
+    async def fake_query(*, prompt: str, options: ClaudeAgentOptions) -> AsyncIterator[object]:
+        assert "Return only the spoken narration as plain text" in prompt
+        calls.append(options)
+        yield StreamEvent(
+            uuid="event-1",
+            session_id="session-1",
+            event={
+                "type": "content_block_delta",
+                "delta": {"type": "text_delta", "text": "First idea. "},
+            },
+        )
+        yield StreamEvent(
+            uuid="event-2",
+            session_id="session-1",
+            event={
+                "type": "content_block_delta",
+                "delta": {"type": "text_delta", "text": "Second idea."},
+            },
+        )
+        yield _result(None)
+
+    service = AnthropicRepositoryService(MODEL, query_function=fake_query)
+    await service.connect("sk-ant-test", validate=False)
+
+    deltas = [delta async for delta in service.stream_speech("Display answer.", tmp_path)]
+
+    assert deltas == ["First idea. ", "Second idea."]
+    assert calls[0].include_partial_messages is True
+    assert calls[0].output_format is None
 
 
 async def test_invalid_agent_structured_output_has_correlated_diagnostics(

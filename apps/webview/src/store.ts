@@ -5,6 +5,8 @@ import type {
   EventEnvelope,
   RepositoryAnswer,
   SidecarStatus,
+  OpenAIVoiceStatus,
+  VoiceProvider,
   VoiceSessionState,
   VoiceTranscript,
 } from "@sentia/protocol";
@@ -15,6 +17,8 @@ interface SentiaState {
   events: EventEnvelope[];
   anthropic: AnthropicStatus;
   deepgram: DeepgramStatus;
+  openaiVoice: OpenAIVoiceStatus;
+  voiceProvider: VoiceProvider;
   extensionVersion: string | null;
   sidecar: SidecarStatus;
   workspaceName: string | null;
@@ -36,11 +40,15 @@ interface SentiaState {
     workspaceTrusted: boolean;
     anthropic: AnthropicStatus;
     deepgram: DeepgramStatus;
+    openaiVoice: OpenAIVoiceStatus;
+    voiceProvider: VoiceProvider;
     agent: AgentOnboarding;
   }): void;
   setAgent(agent: AgentOnboarding): void;
   setAnthropic(anthropic: AnthropicStatus): void;
   setDeepgram(deepgram: DeepgramStatus): void;
+  setOpenAIVoice(openaiVoice: OpenAIVoiceStatus): void;
+  setVoiceProvider(voiceProvider: VoiceProvider): void;
   setRepositoryAnswer(requestId: string, payload: RepositoryAnswer): void;
   setRequestError(requestId: string, error: string): void;
   setSidecar(sidecar: SidecarStatus): void;
@@ -73,6 +81,8 @@ export const useSentiaStore = create<SentiaState>((set) => ({
     message: null,
   },
   deepgram: { connected: false, message: null },
+  openaiVoice: { connected: false, message: null },
+  voiceProvider: "deepgram",
   extensionVersion: null,
   sidecar: disconnected,
   workspaceName: null,
@@ -88,6 +98,8 @@ export const useSentiaStore = create<SentiaState>((set) => ({
   setAgent: (agent) => set({ agent }),
   setAnthropic: (anthropic) => set({ anthropic }),
   setDeepgram: (deepgram) => set({ deepgram }),
+  setOpenAIVoice: (openaiVoice) => set({ openaiVoice }),
+  setVoiceProvider: (voiceProvider) => set({ voiceProvider }),
   setRepositoryAnswer: (requestId, payload) =>
     set({ repositoryAnswer: { requestId, payload }, requestError: null }),
   setRequestError: (requestId, error) =>

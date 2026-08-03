@@ -8,6 +8,7 @@
     "node": ">=22"
   },
   "scripts": {
+    "start": "npm run build && node scripts/start-sentia.mjs",
     "build": "npm run build:protocol && npm run build:editor-client && npm run build:webview && npm run build:extension",
     "build:protocol": "npm --prefix packages/protocol run build",
     "build:editor-client": "npm --prefix packages/editor-client run build",

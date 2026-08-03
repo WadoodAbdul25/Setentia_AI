@@ -140,7 +140,9 @@ async def test_claude_adapter_streams_partial_text_without_repeating_complete_te
         )
 
     adapter = ClaudeAgentAdapter(
-        api_key="test-key", default_model="claude-test", query_function=fake_query
+        api_key="test-key",  # pragma: allowlist secret
+        default_model="claude-test",
+        query_function=fake_query,
     )
     events = [
         event
@@ -185,7 +187,9 @@ async def test_claude_adapter_does_not_duplicate_an_error_result(tmp_path: Path)
         raise RuntimeError("SDK raises after yielding an error result")
 
     adapter = ClaudeAgentAdapter(
-        api_key="test-key", default_model="claude-test", query_function=fake_query
+        api_key="test-key",  # pragma: allowlist secret
+        default_model="claude-test",
+        query_function=fake_query,
     )
     events = [
         event

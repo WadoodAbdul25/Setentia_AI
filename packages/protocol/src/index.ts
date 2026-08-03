@@ -76,6 +76,17 @@ export const deepgramStatusSchema = z.object({
 
 export type DeepgramStatus = z.infer<typeof deepgramStatusSchema>;
 
+export const openaiVoiceStatusSchema = z.object({
+  connected: z.boolean(),
+  message: z.string().nullable(),
+});
+
+export type OpenAIVoiceStatus = z.infer<typeof openaiVoiceStatusSchema>;
+
+export const voiceProviderSchema = z.enum(["deepgram", "openai"]);
+
+export type VoiceProvider = z.infer<typeof voiceProviderSchema>;
+
 export const fluxModelSchema = z.enum([
   "flux-general-en",
   "flux-general-multi",
@@ -225,6 +236,12 @@ export const webviewToExtensionMessageSchema = z.discriminatedUnion("type", [
   requestBase.extend({ type: z.literal("anthropic.disconnect") }),
   requestBase.extend({ type: z.literal("deepgram.connect") }),
   requestBase.extend({ type: z.literal("deepgram.disconnect") }),
+  requestBase.extend({ type: z.literal("openai_voice.connect") }),
+  requestBase.extend({ type: z.literal("openai_voice.disconnect") }),
+  requestBase.extend({
+    type: z.literal("voice.provider.select"),
+    provider: voiceProviderSchema,
+  }),
   requestBase.extend({
     type: z.literal("agent.select"),
     provider: agentProviderSchema,
@@ -269,6 +286,8 @@ export const extensionToWebviewMessageSchema = z.discriminatedUnion("type", [
       sidecar: sidecarStatusSchema,
       anthropic: anthropicStatusSchema,
       deepgram: deepgramStatusSchema,
+      openaiVoice: openaiVoiceStatusSchema,
+      voiceProvider: voiceProviderSchema,
       agent: agentOnboardingSchema,
     }),
   }),
@@ -280,6 +299,14 @@ export const extensionToWebviewMessageSchema = z.discriminatedUnion("type", [
   z.object({
     type: z.literal("deepgram.status"),
     payload: deepgramStatusSchema,
+  }),
+  z.object({
+    type: z.literal("openai_voice.status"),
+    payload: openaiVoiceStatusSchema,
+  }),
+  z.object({
+    type: z.literal("voice.provider.status"),
+    payload: voiceProviderSchema,
   }),
   voiceServerMessageSchema,
   z.object({ type: z.literal("agent.status"), payload: agentOnboardingSchema }),

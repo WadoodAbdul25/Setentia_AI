@@ -1,9 +1,10 @@
 #import <AVFoundation/AVFoundation.h>
 #import <Foundation/Foundation.h>
 #import <signal.h>
+#import <stdlib.h>
 #import <unistd.h>
 
-static const double SentiaSampleRate = 16000.0;
+static double SentiaSampleRate = 16000.0;
 
 static void fail(NSString *message) {
   NSString *line = [NSString stringWithFormat:@"ERROR: %@\n", message];
@@ -133,8 +134,15 @@ static BOOL microphoneAllowed(void) {
 
 static void stopRecorder(int signalNumber) { exit(0); }
 
-int main(void) {
+int main(int argc, const char *argv[]) {
   @autoreleasepool {
+    if (argc > 1) {
+      int requestedRate = atoi(argv[1]);
+      if (requestedRate != 16000 && requestedRate != 24000) {
+        fail(@"Sample rate must be 16000 or 24000 Hz.");
+      }
+      SentiaSampleRate = (double)requestedRate;
+    }
     if (!microphoneAllowed()) {
       fail(@"Microphone access was denied. Allow Sentia Microphone in System "
            @"Settings > Privacy & Security > Microphone.");
@@ -148,8 +156,9 @@ int main(void) {
 
     signal(SIGINT, stopRecorder);
     signal(SIGTERM, stopRecorder);
-    const char *ready = "READY: Capturing 16 kHz mono PCM.\n";
-    write(STDERR_FILENO, ready, strlen(ready));
+    NSString *ready = [NSString stringWithFormat:@"READY: Capturing %.0f kHz mono PCM.\n",
+                                                SentiaSampleRate / 1000.0];
+    write(STDERR_FILENO, ready.UTF8String, strlen(ready.UTF8String));
     [[NSRunLoop mainRunLoop] run];
   }
   return 0;

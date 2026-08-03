@@ -5,6 +5,7 @@ import * as path from "node:path";
 import {
   agentProviderSchema,
   fluxModelSchema,
+  voiceProviderSchema,
   webviewToExtensionMessageSchema,
   type AgentOnboarding,
   type AgentProvider,
@@ -13,7 +14,9 @@ import {
   type AnthropicStatus,
   type DeepgramStatus,
   type EvidenceRange,
+  type OpenAIVoiceStatus,
   type SidecarStatus,
+  type VoiceProvider,
   type VoiceServerMessage,
 } from "@sentia/protocol";
 import * as vscode from "vscode";
@@ -21,12 +24,15 @@ import * as vscode from "vscode";
 import type { SidecarRuntime } from "./sidecarRuntime.js";
 import { DeepgramSpeech } from "./deepgramSpeech.js";
 import { NativeMicrophone } from "./nativeMicrophone.js";
+import { OpenAISpeech } from "./openaiSpeech.js";
 
 export class SentiaViewProvider implements vscode.WebviewViewProvider {
   static readonly viewType = "sentia.sidebar";
   private static readonly anthropicSecretKey = "sentia.anthropicApiKey"; // pragma: allowlist secret
   private static readonly deepgramSecretKey = "sentia.deepgramApiKey"; // pragma: allowlist secret
+  private static readonly openaiVoiceSecretKey = "sentia.openaiVoiceApiKey"; // pragma: allowlist secret
   private static readonly agentProviderKey = "sentia.agentProvider";
+  private static readonly voiceProviderKey = "sentia.voiceProvider";
   private view: vscode.WebviewView | undefined;
   private agent: AgentOnboarding = {
     selectedProvider: null,
@@ -41,9 +47,15 @@ export class SentiaViewProvider implements vscode.WebviewViewProvider {
     connected: false,
     message: null,
   };
+  private openaiVoice: OpenAIVoiceStatus = {
+    connected: false,
+    message: null,
+  };
+  private voiceProvider: VoiceProvider = "deepgram";
   private readonly evidenceDecoration: vscode.TextEditorDecorationType;
   private readonly microphone: NativeMicrophone;
-  private readonly speech: DeepgramSpeech;
+  private readonly deepgramSpeech: DeepgramSpeech;
+  private readonly openaiSpeech: OpenAISpeech;
   private activeVoiceSessionId: string | undefined;
 
   constructor(
@@ -52,7 +64,8 @@ export class SentiaViewProvider implements vscode.WebviewViewProvider {
     private readonly output: vscode.OutputChannel,
   ) {
     this.microphone = new NativeMicrophone(context, output);
-    this.speech = new DeepgramSpeech(context, output);
+    this.deepgramSpeech = new DeepgramSpeech(context, output);
+    this.openaiSpeech = new OpenAISpeech(context, output);
     this.evidenceDecoration = vscode.window.createTextEditorDecorationType({
       backgroundColor: new vscode.ThemeColor(
         "editor.findMatchHighlightBackground",
@@ -66,7 +79,8 @@ export class SentiaViewProvider implements vscode.WebviewViewProvider {
     this.context.subscriptions.push(
       this.evidenceDecoration,
       this.microphone,
-      this.speech,
+      this.deepgramSpeech,
+      this.openaiSpeech,
     );
   }
 
@@ -90,7 +104,8 @@ export class SentiaViewProvider implements vscode.WebviewViewProvider {
         this.runtime.cancelVoice(this.activeVoiceSessionId);
         this.activeVoiceSessionId = undefined;
       }
-      this.speech.stop();
+      this.stopSpeech();
+      this.deepgramSpeech.closeSession();
       this.view = undefined;
     });
 
@@ -99,6 +114,8 @@ export class SentiaViewProvider implements vscode.WebviewViewProvider {
       await this.attachWorkspaceSnapshot();
       await this.restoreAnthropicKey();
       await this.restoreDeepgramKey();
+      await this.restoreOpenAIVoiceKey();
+      this.restoreVoiceProvider();
       await this.restoreAgentProvider();
     } catch (error) {
       this.output.appendLine(
@@ -215,7 +232,7 @@ export class SentiaViewProvider implements vscode.WebviewViewProvider {
   }
 
   async disconnectDeepgram(): Promise<void> {
-    this.speech.stop();
+    this.deepgramSpeech.stop();
     await this.context.secrets.delete(SentiaViewProvider.deepgramSecretKey);
     try {
       this.setDeepgramStatus(await this.runtime.clearDeepgramKey());
@@ -225,6 +242,59 @@ export class SentiaViewProvider implements vscode.WebviewViewProvider {
         message: "Deepgram is disconnected.",
       });
     }
+  }
+
+  async connectOpenAIVoice(): Promise<void> {
+    const apiKey = await vscode.window.showInputBox({
+      title: "Connect Sentia Voice to OpenAI",
+      prompt:
+        "Paste an OpenAI Platform API key. This is separate from ChatGPT/Codex login and stays in VS Code SecretStorage.",
+      placeHolder: "OpenAI API key",
+      password: true,
+      ignoreFocusOut: true,
+      validateInput: (value) =>
+        value.trim().length < 20
+          ? "Enter a complete OpenAI API key."
+          : undefined,
+    });
+    if (apiKey === undefined) {
+      return;
+    }
+    const status = await this.runtime.setOpenAIVoiceKey(apiKey.trim());
+    await this.context.secrets.store(
+      SentiaViewProvider.openaiVoiceSecretKey,
+      apiKey.trim(),
+    );
+    this.setOpenAIVoiceStatus(status);
+    void vscode.window.showInformationMessage(
+      "Sentia voice is connected to the OpenAI API.",
+    );
+  }
+
+  async disconnectOpenAIVoice(): Promise<void> {
+    this.openaiSpeech.stop();
+    await this.context.secrets.delete(SentiaViewProvider.openaiVoiceSecretKey);
+    try {
+      this.setOpenAIVoiceStatus(await this.runtime.clearOpenAIVoiceKey());
+    } catch {
+      this.setOpenAIVoiceStatus({
+        connected: false,
+        message: "OpenAI Voice is disconnected.",
+      });
+    }
+  }
+
+  async selectVoiceProvider(provider: VoiceProvider): Promise<void> {
+    this.stopSpeech();
+    if (this.voiceProvider === "deepgram" && provider !== "deepgram") {
+      this.deepgramSpeech.closeSession();
+    }
+    await this.context.globalState.update(
+      SentiaViewProvider.voiceProviderKey,
+      provider,
+    );
+    this.voiceProvider = provider;
+    this.post({ type: "voice.provider.status", payload: provider });
   }
 
   async selectAgentProvider(provider: AgentProvider): Promise<void> {
@@ -308,6 +378,8 @@ export class SentiaViewProvider implements vscode.WebviewViewProvider {
     await this.attachWorkspaceSnapshot();
     await this.restoreAnthropicKey();
     await this.restoreDeepgramKey();
+    await this.restoreOpenAIVoiceKey();
+    this.restoreVoiceProvider();
     await this.restoreAgentProvider();
   }
 
@@ -372,6 +444,18 @@ export class SentiaViewProvider implements vscode.WebviewViewProvider {
           await this.disconnectDeepgram();
           this.respond(message.requestId, true);
           break;
+        case "openai_voice.connect":
+          await this.connectOpenAIVoice();
+          this.respond(message.requestId, true);
+          break;
+        case "openai_voice.disconnect":
+          await this.disconnectOpenAIVoice();
+          this.respond(message.requestId, true);
+          break;
+        case "voice.provider.select":
+          await this.selectVoiceProvider(message.provider);
+          this.respond(message.requestId, true);
+          break;
         case "agent.select":
           await this.selectAgentProvider(message.provider);
           this.respond(message.requestId, true);
@@ -408,41 +492,83 @@ export class SentiaViewProvider implements vscode.WebviewViewProvider {
           });
           if (message.responseMode === "voice") {
             try {
+              const selectedVoiceProvider = this.voiceProvider;
               const apiKey = await this.context.secrets.get(
-                SentiaViewProvider.deepgramSecretKey,
+                selectedVoiceProvider === "deepgram"
+                  ? SentiaViewProvider.deepgramSecretKey
+                  : SentiaViewProvider.openaiVoiceSecretKey,
               );
               if (!apiKey) {
                 void vscode.window.showWarningMessage(
-                  "Sentia displayed the answer, but Deepgram is disconnected so it could not speak.",
+                  `Sentia displayed the answer, but ${selectedVoiceProvider === "deepgram" ? "Deepgram" : "OpenAI Voice"} is disconnected so it could not speak.`,
                 );
                 break;
               }
-              const spoken = await this.runtime.renderSpeech(
-                folder.uri.fsPath,
-                answer.answer,
-                provider,
-              );
               const voiceConfiguration =
                 vscode.workspace.getConfiguration("sentia.voice");
-              this.speech.speak(
-                {
-                  apiKey,
-                  endpoint: voiceConfiguration.get<string>(
-                    "deepgramEndpoint",
-                    "wss://api.deepgram.com",
-                  ),
-                  model: voiceConfiguration.get<string>(
-                    "deepgramTtsModel",
-                    "flux-marcus-en",
-                  ),
-                  text: spoken.spokenAnswer,
-                },
-                (error) => {
-                  void vscode.window.showWarningMessage(
-                    `Sentia displayed the answer, but speech failed: ${error}`,
+              const onSpeechError = (error: string): void => {
+                void vscode.window.showWarningMessage(
+                  `Sentia displayed the answer, but speech failed: ${error}`,
+                );
+              };
+              if (selectedVoiceProvider === "deepgram") {
+                try {
+                  await this.deepgramSpeech.beginTurn(
+                    {
+                      apiKey,
+                      endpoint: voiceConfiguration.get<string>(
+                        "deepgramEndpoint",
+                        "wss://api.deepgram.com",
+                      ),
+                      model: voiceConfiguration.get<string>(
+                        "deepgramTtsModel",
+                        "flux-bruce-en",
+                      ),
+                      speed: voiceConfiguration.get<number>(
+                        "deepgramTtsSpeed",
+                        1,
+                      ),
+                    },
+                    onSpeechError,
                   );
-                },
-              );
+                  for await (const delta of this.runtime.renderSpeechStream(
+                    folder.uri.fsPath,
+                    answer.answer,
+                    provider,
+                  )) {
+                    this.deepgramSpeech.appendText(delta);
+                  }
+                  this.deepgramSpeech.flushTurn();
+                } catch (error) {
+                  this.deepgramSpeech.abortTurn();
+                  throw error;
+                }
+              } else {
+                const spoken = await this.runtime.renderSpeech(
+                  folder.uri.fsPath,
+                  answer.answer,
+                  provider,
+                );
+                void this.openaiSpeech.speak(
+                  {
+                    apiKey,
+                    endpoint: voiceConfiguration.get<string>(
+                      "openaiEndpoint",
+                      "https://api.openai.com",
+                    ),
+                    model: voiceConfiguration.get<string>(
+                      "openaiTtsModel",
+                      "gpt-4o-mini-tts",
+                    ),
+                    voice: voiceConfiguration.get<string>(
+                      "openaiVoice",
+                      "marin",
+                    ),
+                    text: spoken.spokenAnswer,
+                  },
+                  onSpeechError,
+                );
+              }
             } catch (error) {
               void vscode.window.showWarningMessage(
                 `Sentia displayed the answer, but could not prepare its spoken version: ${String(error)}`,
@@ -452,27 +578,50 @@ export class SentiaViewProvider implements vscode.WebviewViewProvider {
           break;
         }
         case "voice.start": {
-          this.speech.stop();
+          this.stopSpeech();
           const folder = this.requireTrustedWorkspace();
           const configuration =
             vscode.workspace.getConfiguration("sentia.voice");
-          const configuredModel = fluxModelSchema.safeParse(
-            configuration.get<unknown>("deepgramModel"),
-          );
-          const model = configuredModel.success
-            ? configuredModel.data
-            : "flux-general-en";
-          const endpoint = configuration.get<string>(
-            "deepgramEndpoint",
-            "wss://api.deepgram.com",
-          );
-          const languageHints =
-            model === "flux-general-multi"
-              ? configuration
-                  .get<string[]>("languageHints", [])
-                  .map((hint) => hint.trim())
-                  .filter(Boolean)
-              : [];
+          const selectedVoiceProvider = this.voiceProvider;
+          let model: string;
+          let endpoint: string;
+          let languageHints: string[];
+          let sampleRate: number;
+          if (selectedVoiceProvider === "deepgram") {
+            const configuredModel = fluxModelSchema.safeParse(
+              configuration.get<unknown>("deepgramModel"),
+            );
+            model = configuredModel.success
+              ? configuredModel.data
+              : "flux-general-en";
+            endpoint = configuration.get<string>(
+              "deepgramEndpoint",
+              "wss://api.deepgram.com",
+            );
+            languageHints =
+              model === "flux-general-multi"
+                ? configuration
+                    .get<string[]>("languageHints", [])
+                    .map((hint) => hint.trim())
+                    .filter(Boolean)
+                : [];
+            sampleRate = 16_000;
+          } else {
+            const configuredOpenAIModel = configuration.get<string>(
+              "openaiTranscriptionModel",
+              "gpt-live-transcribe",
+            );
+            model =
+              configuredOpenAIModel === "gpt-live-transcribe"
+                ? configuredOpenAIModel
+                : "gpt-live-transcribe";
+            endpoint = configuration.get<string>(
+              "openaiRealtimeEndpoint",
+              "wss://api.openai.com/v1/realtime?model=gpt-realtime",
+            );
+            languageHints = [];
+            sampleRate = 24_000;
+          }
           const editor = vscode.window.activeTextEditor;
           const relativeActiveFile = editor
             ? path.relative(folder.uri.fsPath, editor.document.uri.fsPath)
@@ -487,11 +636,12 @@ export class SentiaViewProvider implements vscode.WebviewViewProvider {
             sessionId: message.sessionId,
             workspacePath: folder.uri.fsPath,
             activeFile,
+            provider: selectedVoiceProvider,
             model,
             endpoint,
             languageHints,
             encoding: "linear16",
-            sampleRate: 16_000,
+            sampleRate,
           });
           this.activeVoiceSessionId = message.sessionId;
           this.microphone.start(
@@ -505,6 +655,7 @@ export class SentiaViewProvider implements vscode.WebviewViewProvider {
                 error,
               });
             },
+            sampleRate,
           );
           this.respond(message.requestId, true);
           break;
@@ -561,6 +712,8 @@ export class SentiaViewProvider implements vscode.WebviewViewProvider {
   private async postBootstrap(): Promise<void> {
     await this.restoreAnthropicKey();
     await this.restoreDeepgramKey();
+    await this.restoreOpenAIVoiceKey();
+    this.restoreVoiceProvider();
     await this.restoreAgentProvider();
     const folder = vscode.workspace.workspaceFolders?.[0];
     const metadata = this.context.extension.packageJSON as {
@@ -576,6 +729,8 @@ export class SentiaViewProvider implements vscode.WebviewViewProvider {
         sidecar: this.runtime.getStatus(),
         anthropic: this.anthropic,
         deepgram: this.deepgram,
+        openaiVoice: this.openaiVoice,
+        voiceProvider: this.voiceProvider,
         agent: this.agent,
       },
     });
@@ -602,6 +757,16 @@ export class SentiaViewProvider implements vscode.WebviewViewProvider {
   private setDeepgramStatus(status: DeepgramStatus): void {
     this.deepgram = status;
     this.post({ type: "deepgram.status", payload: status });
+  }
+
+  private setOpenAIVoiceStatus(status: OpenAIVoiceStatus): void {
+    this.openaiVoice = status;
+    this.post({ type: "openai_voice.status", payload: status });
+  }
+
+  private stopSpeech(): void {
+    this.deepgramSpeech.cancelPlayback();
+    this.openaiSpeech.stop();
   }
 
   private postAgentStatus(): void {
@@ -666,6 +831,33 @@ export class SentiaViewProvider implements vscode.WebviewViewProvider {
         message: error instanceof Error ? error.message : String(error),
       });
     }
+  }
+
+  private async restoreOpenAIVoiceKey(): Promise<void> {
+    const apiKey = await this.context.secrets.get(
+      SentiaViewProvider.openaiVoiceSecretKey,
+    );
+    if (!apiKey) {
+      this.setOpenAIVoiceStatus({ connected: false, message: null });
+      return;
+    }
+    try {
+      this.setOpenAIVoiceStatus(await this.runtime.setOpenAIVoiceKey(apiKey));
+    } catch (error) {
+      this.setOpenAIVoiceStatus({
+        connected: false,
+        message: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
+  private restoreVoiceProvider(): void {
+    const stored = this.context.globalState.get<unknown>(
+      SentiaViewProvider.voiceProviderKey,
+    );
+    const parsed = voiceProviderSchema.safeParse(stored);
+    this.voiceProvider = parsed.success ? parsed.data : "deepgram";
+    this.post({ type: "voice.provider.status", payload: this.voiceProvider });
   }
 
   private requireTrustedWorkspace(): vscode.WorkspaceFolder {

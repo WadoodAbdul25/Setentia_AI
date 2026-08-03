@@ -4,6 +4,7 @@ import asyncio
 import copy
 import tempfile
 import time
+from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import cast
 from uuid import uuid4
@@ -31,6 +32,7 @@ from sentia_sidecar.repository_intelligence import (
     SpeechAnswer,
     bounded_text,
     speech_render_prompt,
+    speech_stream_prompt,
     validate_evidence,
 )
 
@@ -87,6 +89,89 @@ class CodexRepositoryService:
                 await self.close()
                 raise RepositoryIntelligenceError(
                     "Codex could not render the answer for speech. "
+                    f"Diagnostic ID: {diagnostic_id}.",
+                    502,
+                ) from error
+
+    async def stream_speech(
+        self,
+        answer: str,
+        workspace_path: Path,
+    ) -> AsyncIterator[str]:
+        del workspace_path
+        diagnostic_id = f"sentia_{uuid4().hex[:12]}"
+        async with self._request_lock:
+            try:
+                codex, _ = await self._codex_client()
+                thread = await codex.thread_start(
+                    approval_mode=ApprovalMode.deny_all,
+                    base_instructions=SPEECH_SYSTEM_PROMPT,
+                    cwd=None,
+                    ephemeral=True,
+                    model=self._requested_model,
+                    sandbox=Sandbox.read_only,
+                )
+                turn = await thread.turn(
+                    speech_stream_prompt(answer),
+                    approval_mode=ApprovalMode.deny_all,
+                    model=self._requested_model,
+                    sandbox=Sandbox.read_only,
+                )
+                emitted = 0
+                streamed = False
+                async for notification in turn.stream():
+                    payload = notification.payload
+                    if notification.method == "item/agentMessage/delta":
+                        delta = getattr(payload, "delta", None)
+                        if not isinstance(delta, str) or not delta:
+                            continue
+                        remaining = 3_000 - emitted
+                        if remaining <= 0:
+                            await turn.interrupt()
+                            break
+                        chunk = delta[:remaining]
+                        emitted += len(chunk)
+                        streamed = True
+                        yield chunk
+                        if len(chunk) < len(delta):
+                            await turn.interrupt()
+                            break
+                        continue
+                    if notification.method == "item/completed" and not streamed:
+                        item = getattr(payload, "item", None)
+                        root = getattr(item, "root", item)
+                        text = getattr(root, "text", None)
+                        if isinstance(text, str) and text:
+                            chunk = text[:3_000]
+                            emitted = len(chunk)
+                            streamed = True
+                            yield chunk
+                        continue
+                    if notification.method == "turn/completed":
+                        completed_turn = getattr(payload, "turn", None)
+                        status = getattr(completed_turn, "status", None)
+                        status_value = getattr(status, "value", status)
+                        if status_value == "failed":
+                            error = getattr(completed_turn, "error", None)
+                            message = getattr(error, "message", None)
+                            raise RepositoryIntelligenceError(
+                                message
+                                or "Codex could not stream the speech rendering. "
+                                f"Diagnostic ID: {diagnostic_id}.",
+                                502,
+                            )
+                if emitted == 0:
+                    raise RepositoryIntelligenceError(
+                        "Codex returned an empty speech rendering. "
+                        f"Diagnostic ID: {diagnostic_id}.",
+                        502,
+                    )
+            except RepositoryIntelligenceError:
+                raise
+            except Exception as error:
+                await self.close()
+                raise RepositoryIntelligenceError(
+                    "Codex could not stream the answer for speech. "
                     f"Diagnostic ID: {diagnostic_id}.",
                     502,
                 ) from error

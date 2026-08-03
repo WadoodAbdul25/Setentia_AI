@@ -21,6 +21,7 @@ export class NativeMicrophone implements vscode.Disposable {
     sessionId: string,
     onAudio: (chunk: Buffer) => void,
     onError: (message: string) => void,
+    sampleRate = 16_000,
   ): void {
     this.stop();
     if (process.platform !== "darwin") {
@@ -34,7 +35,10 @@ export class NativeMicrophone implements vscode.Disposable {
     );
     this.stopping = false;
     this.sessionId = sessionId;
-    const child = spawn(executable, [], {
+    if (sampleRate !== 16_000 && sampleRate !== 24_000) {
+      throw new Error("Native microphone supports 16 kHz or 24 kHz PCM.");
+    }
+    const child = spawn(executable, [String(sampleRate)], {
       cwd: this.context.extensionPath,
       env: process.env,
       shell: false,

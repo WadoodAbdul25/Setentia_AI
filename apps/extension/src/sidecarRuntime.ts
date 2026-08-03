@@ -3,6 +3,7 @@ import { randomBytes } from "node:crypto";
 import { existsSync } from "node:fs";
 import { createServer } from "node:net";
 import * as path from "node:path";
+import type { ReadableStream } from "node:stream/web";
 
 import {
   agentConnectionStatusSchema,
@@ -11,6 +12,7 @@ import {
   deepgramStatusSchema,
   eventEnvelopeSchema,
   healthResponseSchema,
+  openaiVoiceStatusSchema,
   projectSnapshotStatusSchema,
   PROTOCOL_VERSION,
   repositoryAnswerSchema,
@@ -27,6 +29,8 @@ import {
   type RepositoryAnswer,
   type SpokenAnswer,
   type SidecarStatus,
+  type OpenAIVoiceStatus,
+  type VoiceProvider,
   type VoiceServerMessage,
 } from "@sentia/protocol";
 import WebSocket from "ws";
@@ -44,7 +48,8 @@ export interface VoiceSessionOptions {
   sessionId: string;
   workspacePath: string;
   activeFile: string | null;
-  model: "flux-general-en" | "flux-general-multi";
+  provider: VoiceProvider;
+  model: string;
   endpoint: string;
   languageHints: string[];
   encoding: "linear16";
@@ -205,6 +210,26 @@ export class SidecarRuntime implements vscode.Disposable {
     );
   }
 
+  async setOpenAIVoiceKey(apiKey: string): Promise<OpenAIVoiceStatus> {
+    return await this.request(
+      "/api/v1/auth/openai-voice",
+      {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ apiKey }),
+      },
+      openaiVoiceStatusSchema,
+    );
+  }
+
+  async clearOpenAIVoiceKey(): Promise<OpenAIVoiceStatus> {
+    return await this.request(
+      "/api/v1/auth/openai-voice",
+      { method: "DELETE" },
+      openaiVoiceStatusSchema,
+    );
+  }
+
   async startVoice(options: VoiceSessionOptions): Promise<void> {
     await this.start();
     this.closeVoiceSocket();
@@ -222,8 +247,12 @@ export class SidecarRuntime implements vscode.Disposable {
     for (const hint of options.languageHints) {
       query.append("languageHint", hint);
     }
+    const voicePath =
+      options.provider === "deepgram"
+        ? "/api/v1/voice/deepgram/transcribe"
+        : "/api/v1/voice/openai/transcribe";
     const socket = new WebSocket(
-      `ws://127.0.0.1:${String(this.port)}/api/v1/voice/transcribe?${query.toString()}`,
+      `ws://127.0.0.1:${String(this.port)}${voicePath}?${query.toString()}`,
       { headers: { Authorization: `Bearer ${this.token ?? ""}` } },
     );
     this.voiceSocket = socket;
@@ -373,6 +402,82 @@ export class SidecarRuntime implements vscode.Disposable {
       },
       spokenAnswerSchema,
     );
+  }
+
+  async *renderSpeechStream(
+    workspacePath: string,
+    answer: string,
+    provider: AgentProvider,
+  ): AsyncGenerator<string> {
+    await this.start();
+    const response = await fetch(
+      `http://127.0.0.1:${String(this.port)}/api/v1/voice/render/stream`,
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${this.token ?? ""}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ workspacePath, answer, provider }),
+      },
+    );
+    if (!response.ok) {
+      const payload = await readResponseJson(response);
+      const detail =
+        typeof payload === "object" &&
+        payload !== null &&
+        "detail" in payload &&
+        typeof payload.detail === "string"
+          ? payload.detail
+          : `Speech rendering failed (${String(response.status)}).`;
+      throw new Error(detail);
+    }
+    if (!response.body) {
+      throw new Error("Speech rendering returned no event stream.");
+    }
+
+    const reader = (
+      response.body as ReadableStream<Uint8Array<ArrayBuffer>>
+    ).getReader();
+    const decoder = new TextDecoder();
+    let pending = "";
+    let completed = false;
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        pending += decoder.decode(value, { stream: !done });
+        const lines = pending.split("\n");
+        pending = lines.pop() ?? "";
+        for (const line of lines) {
+          const event = parseSpeechStreamEvent(line);
+          if (event.type === "delta") {
+            yield event.text;
+          } else if (event.type === "error") {
+            throw new Error(event.message);
+          } else {
+            completed = true;
+          }
+        }
+        if (done) {
+          break;
+        }
+      }
+      if (pending.trim()) {
+        const event = parseSpeechStreamEvent(pending);
+        if (event.type === "delta") {
+          yield event.text;
+        } else if (event.type === "error") {
+          throw new Error(event.message);
+        } else {
+          completed = true;
+        }
+      }
+      if (!completed) {
+        throw new Error("Speech rendering ended before its completion event.");
+      }
+    } finally {
+      reader.releaseLock();
+    }
   }
 
   async attachWorkspaceSnapshot(
@@ -612,6 +717,45 @@ export class SidecarRuntime implements vscode.Disposable {
 
 interface ResponseSchema<T> {
   parse(value: unknown): T;
+}
+
+type SpeechStreamEvent =
+  | { type: "delta"; text: string }
+  | { type: "done" }
+  | { type: "error"; message: string };
+
+export function parseSpeechStreamEvent(line: string): SpeechStreamEvent {
+  let value: unknown;
+  try {
+    value = JSON.parse(line) as unknown;
+  } catch (error) {
+    throw new Error(
+      `Speech rendering returned malformed JSON: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+  if (typeof value !== "object" || value === null || !("type" in value)) {
+    throw new Error("Speech rendering returned an invalid event.");
+  }
+  if (value.type === "done") {
+    return { type: "done" };
+  }
+  if (
+    value.type === "delta" &&
+    "text" in value &&
+    typeof value.text === "string" &&
+    value.text.length > 0
+  ) {
+    return { type: "delta", text: value.text };
+  }
+  if (
+    value.type === "error" &&
+    "message" in value &&
+    typeof value.message === "string" &&
+    value.message.length > 0
+  ) {
+    return { type: "error", message: value.message };
+  }
+  throw new Error("Speech rendering returned an unsupported event.");
 }
 
 async function readResponseJson(response: Response): Promise<unknown> {

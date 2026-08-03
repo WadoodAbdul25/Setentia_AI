@@ -14,6 +14,7 @@ import structlog
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, WebSocket, WebSocketDisconnect
 from sqlalchemy import select
 from starlette import status
+from starlette.responses import StreamingResponse
 
 from sentia_sidecar.agent_runtime import (
     AgentRouter,
@@ -38,6 +39,8 @@ from sentia_sidecar.protocol import (
     DeepgramCredentialSet,
     DeepgramCredentialStatus,
     HealthResponse,
+    OpenAIVoiceCredentialSet,
+    OpenAIVoiceCredentialStatus,
     ProjectSnapshotStatus,
     RepositoryAnswer,
     RepositoryQuestion,
@@ -63,6 +66,9 @@ from sentia_sidecar.voice import (
     DeepgramFluxGateway,
     FluxConnection,
     FluxGateway,
+    OpenAIRealtimeTranscriptionGateway,
+    OpenAIVoiceGateway,
+    OpenAIVoiceOptions,
     RepositoryTranscriptCorrector,
     VoiceError,
     VoiceOptions,
@@ -89,6 +95,7 @@ def create_app(
     agent_router: AgentRouter | None = None,
     codex_login_manager: CodexLogin | None = None,
     flux_gateway: FluxGateway | None = None,
+    openai_voice_gateway: OpenAIVoiceGateway | None = None,
 ) -> FastAPI:
     resolved = settings or get_settings()
     expected_token = resolved.token.get_secret_value()
@@ -104,8 +111,10 @@ def create_app(
     )
     agents = agent_router or create_agent_router()
     codex_login = codex_login_manager or CodexLoginManager()
-    voice_gateway = flux_gateway or DeepgramFluxGateway()
+    deepgram_voice_gateway = flux_gateway or DeepgramFluxGateway()
+    openai_transcription_gateway = openai_voice_gateway or OpenAIRealtimeTranscriptionGateway()
     deepgram_api_key: str | None = None
+    openai_voice_api_key: str | None = None
 
     async def snapshot_updated(status: ProjectSnapshotStatus, triggers: list[str]) -> None:
         await events.publish(
@@ -274,6 +283,42 @@ def create_app(
             message="Deepgram is disconnected.",
         )
 
+    @app.get(
+        "/api/v1/auth/openai-voice",
+        response_model=OpenAIVoiceCredentialStatus,
+        dependencies=auth_dependencies,
+    )
+    async def openai_voice_status() -> OpenAIVoiceCredentialStatus:
+        return OpenAIVoiceCredentialStatus(connected=openai_voice_api_key is not None)
+
+    @app.put(
+        "/api/v1/auth/openai-voice",
+        response_model=OpenAIVoiceCredentialStatus,
+        dependencies=auth_dependencies,
+    )
+    async def connect_openai_voice(
+        body: OpenAIVoiceCredentialSet,
+    ) -> OpenAIVoiceCredentialStatus:
+        nonlocal openai_voice_api_key
+        openai_voice_api_key = body.api_key.get_secret_value()
+        return OpenAIVoiceCredentialStatus(
+            connected=True,
+            message="OpenAI Voice is connected.",
+        )
+
+    @app.delete(
+        "/api/v1/auth/openai-voice",
+        response_model=OpenAIVoiceCredentialStatus,
+        dependencies=auth_dependencies,
+    )
+    async def disconnect_openai_voice() -> OpenAIVoiceCredentialStatus:
+        nonlocal openai_voice_api_key
+        openai_voice_api_key = None
+        return OpenAIVoiceCredentialStatus(
+            connected=False,
+            message="OpenAI Voice is disconnected.",
+        )
+
     @app.put(
         "/api/v1/repository/snapshot",
         response_model=ProjectSnapshotStatus,
@@ -364,6 +409,57 @@ def create_app(
         return SpeechRenderResponse(spoken_answer=rendered.spoken_answer)
 
     @app.post(
+        "/api/v1/voice/render/stream",
+        dependencies=auth_dependencies,
+    )
+    async def stream_speech(body: SpeechRenderRequest) -> StreamingResponse:
+        async def events() -> AsyncIterator[bytes]:
+            try:
+                async for delta in intelligence.stream_speech(
+                    body.provider,
+                    body.answer,
+                    Path(body.workspace_path),
+                ):
+                    if delta:
+                        yield (json.dumps({"type": "delta", "text": delta}) + "\n").encode()
+                yield b'{"type":"done"}\n'
+            except RepositoryIntelligenceError as error:
+                logger.warning(
+                    "speech_render_stream_failed",
+                    provider=body.provider,
+                    status_code=error.status_code,
+                    error_type=type(error).__name__,
+                )
+                yield (
+                    json.dumps(
+                        {
+                            "type": "error",
+                            "message": "Sentia could not prepare the spoken response.",
+                        }
+                    )
+                    + "\n"
+                ).encode()
+            except Exception as error:
+                logger.exception(
+                    "speech_render_stream_failed",
+                    provider=body.provider,
+                    error_type=type(error).__name__,
+                )
+                yield (
+                    b'{"type":"error","message":'
+                    b'"Sentia could not prepare the spoken response."}\n'
+                )
+
+        return StreamingResponse(
+            events(),
+            media_type="application/x-ndjson",
+            headers={
+                "Cache-Control": "no-store",
+                "X-Content-Type-Options": "nosniff",
+            },
+        )
+
+    @app.post(
         "/api/v1/conversations",
         response_model=ConversationResponse,
         status_code=status.HTTP_201_CREATED,
@@ -448,26 +544,47 @@ def create_app(
         except WebSocketDisconnect:
             logger.info("websocket_disconnected")
 
-    @app.websocket("/api/v1/voice/transcribe")
+    @app.websocket("/api/v1/voice/deepgram/transcribe")
+    @app.websocket("/api/v1/voice/openai/transcribe")
     async def transcribe_voice(
         websocket: WebSocket,
         session_id: Annotated[str, Query(alias="sessionId", min_length=1)],
         workspace_path: Annotated[str, Query(alias="workspacePath", min_length=1)],
-        model: Annotated[str, Query()] = "flux-general-en",
-        endpoint: Annotated[str, Query()] = "wss://api.deepgram.com",
+        model: Annotated[str | None, Query()] = None,
+        endpoint: Annotated[str | None, Query()] = None,
         encoding: Annotated[str | None, Query()] = None,
         sample_rate: Annotated[int | None, Query(alias="sampleRate", gt=0)] = None,
         active_file: Annotated[str | None, Query(alias="activeFile")] = None,
         language_hints: Annotated[list[str] | None, Query(alias="languageHint")] = None,
     ) -> None:
+        selected_provider = (
+            "deepgram" if websocket.url.path == "/api/v1/voice/deepgram/transcribe" else "openai"
+        )
+        selected_model = model or (
+            "flux-general-en" if selected_provider == "deepgram" else "gpt-live-transcribe"
+        )
+        selected_endpoint = endpoint or (
+            "wss://api.deepgram.com"
+            if selected_provider == "deepgram"
+            else "wss://api.openai.com/v1/realtime?model=gpt-realtime"
+        )
         supplied = _bearer_token(websocket.headers.get("authorization"))
         if supplied is None or not hmac.compare_digest(supplied, expected_token):
             await websocket.close(code=status.WS_1008_POLICY_VIOLATION, reason="Unauthorized")
             return
-        if deepgram_api_key is None:
+        if selected_provider not in {"deepgram", "openai"}:
             await websocket.close(
                 code=status.WS_1008_POLICY_VIOLATION,
-                reason="Connect Deepgram before starting voice input",
+                reason="Unsupported voice provider",
+            )
+            return
+        selected_api_key = (
+            deepgram_api_key if selected_provider == "deepgram" else openai_voice_api_key
+        )
+        if selected_api_key is None:
+            await websocket.close(
+                code=status.WS_1008_POLICY_VIOLATION,
+                reason=f"Connect {selected_provider.title()} before starting voice input",
             )
             return
 
@@ -477,7 +594,9 @@ def create_app(
                 "type": "voice.status",
                 "sessionId": session_id,
                 "state": "connecting",
-                "message": "Connecting to Deepgram Flux…",
+                "message": "Connecting to Deepgram Flux…"
+                if selected_provider == "deepgram"
+                else "Connecting to OpenAI live transcription…",
             }
         )
         connection: FluxConnection | None = None
@@ -488,21 +607,45 @@ def create_app(
             vocabulary = build_vocabulary(repository, active_file)
             keyterms = select_keyterms(vocabulary)
             corrector = RepositoryTranscriptCorrector(vocabulary)
-            options = VoiceOptions(
-                model=model,
-                endpoint=endpoint,
-                language_hints=tuple(language_hints or ()),
-                encoding=encoding,
-                sample_rate=sample_rate,
+            logger.info(
+                "voice_pipeline_selected",
+                provider=selected_provider,
+                model=selected_model,
+                route=websocket.url.path,
+                keyterm_count=len(keyterms),
+                sends_transcription_prompt=False,
             )
-            active_connection = await voice_gateway.connect(deepgram_api_key, options, keyterms)
+            if selected_provider == "deepgram":
+                options = VoiceOptions(
+                    model=selected_model,
+                    endpoint=selected_endpoint,
+                    language_hints=tuple(language_hints or ()),
+                    encoding=encoding,
+                    sample_rate=sample_rate,
+                )
+                active_connection = await deepgram_voice_gateway.connect(
+                    selected_api_key, options, keyterms
+                )
+            else:
+                openai_options = OpenAIVoiceOptions(
+                    model=selected_model,
+                    endpoint=selected_endpoint,
+                    sample_rate=sample_rate or 24_000,
+                )
+                active_connection = await openai_transcription_gateway.connect(
+                    selected_api_key, openai_options, keyterms
+                )
             connection = active_connection
             await websocket.send_json(
                 {
                     "type": "voice.status",
                     "sessionId": session_id,
                     "state": "listening",
-                    "message": f"Flux is listening with {len(keyterms)} repository keyterms.",
+                    "message": (
+                        f"Flux is listening with {len(keyterms)} repository keyterms."
+                        if selected_provider == "deepgram"
+                        else f"OpenAI is listening with {len(keyterms)} repository terms."
+                    ),
                 }
             )
 
@@ -536,21 +679,24 @@ def create_app(
                     if control.get("type") == "voice.cancel":
                         return "cancel"
 
-            async def forward_results() -> None:
+            async def forward_results() -> bool:
                 async for payload in active_connection.messages():
                     message_type = payload.get("type")
                     if message_type == "Error":
                         description = payload.get("description")
+                        default_error = (
+                            f"{selected_provider.title()} transcription returned an error."
+                        )
                         await websocket.send_json(
                             {
                                 "type": "voice.error",
                                 "sessionId": session_id,
                                 "error": description
                                 if isinstance(description, str)
-                                else "Deepgram Flux returned an error.",
+                                else default_error,
                             }
                         )
-                        return
+                        return False
                     if message_type != "TurnInfo" or payload.get("event") not in FLUX_EVENTS:
                         continue
                     transcript = payload.get("transcript", "")
@@ -584,22 +730,27 @@ def create_app(
                             },
                         }
                     )
+                return True
 
             audio_task = asyncio.create_task(forward_audio())
             result_task = asyncio.create_task(forward_results())
             done, _ = await asyncio.wait(
                 {audio_task, result_task}, return_when=asyncio.FIRST_COMPLETED
             )
-            if audio_task in done:
+            result_ok = True
+            if result_task in done:
+                audio_task.cancel()
+                result_ok = await result_task
+                await active_connection.close()
+            else:
                 outcome = await audio_task
                 if outcome == "stop":
-                    await result_task
+                    result_ok = await result_task
                 else:
                     result_task.cancel()
                     await active_connection.close()
-            else:
-                audio_task.cancel()
-                await result_task
+            if not result_ok:
+                return
             await websocket.send_json(
                 {
                     "type": "voice.status",
@@ -615,12 +766,17 @@ def create_app(
                 {"type": "voice.error", "sessionId": session_id, "error": str(error)}
             )
         except Exception as error:
-            logger.exception("voice_session_failed", error_type=type(error).__name__)
+            detail = str(error) or type(error).__name__
+            logger.exception(
+                "voice_session_failed",
+                error_type=type(error).__name__,
+                error=detail,
+            )
             await websocket.send_json(
                 {
                     "type": "voice.error",
                     "sessionId": session_id,
-                    "error": "The voice session failed. Open Sentia Diagnostics for details.",
+                    "error": f"The voice session failed: {detail}",
                 }
             )
         finally:

@@ -411,6 +411,52 @@ button {
   flex-direction: column;
 }
 
+.voice-provider-row {
+  align-items: center;
+  display: flex;
+  font-size: 10px;
+  justify-content: space-between;
+  margin-bottom: 8px;
+}
+
+.voice-provider-row > span,
+.voice-disclosure {
+  color: var(--vscode-descriptionForeground);
+}
+
+.voice-provider-toggle {
+  background: var(--vscode-button-secondaryBackground);
+  border: 1px solid var(--vscode-widget-border);
+  border-radius: 5px;
+  display: flex;
+  overflow: hidden;
+}
+
+.voice-provider-toggle button {
+  background: transparent;
+  border: 0;
+  color: var(--vscode-button-secondaryForeground);
+  cursor: pointer;
+  font-size: 9px;
+  padding: 4px 7px;
+}
+
+.voice-provider-toggle button[aria-pressed="true"] {
+  background: var(--vscode-button-background);
+  color: var(--vscode-button-foreground);
+}
+
+.voice-provider-toggle button:disabled {
+  cursor: default;
+  opacity: 0.6;
+}
+
+.voice-disclosure {
+  font-size: 9px;
+  line-height: 1.4;
+  margin: 0 0 9px;
+}
+
 .question-card label {
   font-size: 12px;
   font-weight: 600;
@@ -421,6 +467,12 @@ button {
   display: flex;
   justify-content: space-between;
   margin-bottom: 8px;
+}
+
+.voice-actions {
+  align-items: center;
+  display: flex;
+  gap: 6px;
 }
 
 .voice-button {
@@ -446,6 +498,19 @@ button {
 .voice-button:disabled {
   cursor: not-allowed;
   opacity: 0.55;
+}
+
+.voice-cancel-button {
+  background: transparent;
+  border: 0;
+  color: var(--vscode-errorForeground);
+  cursor: pointer;
+  font-size: 10px;
+  padding: 4px 3px;
+}
+
+.voice-cancel-button:hover {
+  text-decoration: underline;
 }
 
 .question-card .voice-status,

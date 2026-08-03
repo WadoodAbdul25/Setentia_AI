@@ -7,7 +7,11 @@ import {
 } from "react";
 
 import type { EditorBridge } from "@sentia/editor-client";
-import type { AgentProvider, EvidenceRange } from "@sentia/protocol";
+import type {
+  AgentProvider,
+  EvidenceRange,
+  VoiceProvider,
+} from "@sentia/protocol";
 import clsx from "clsx";
 
 import {
@@ -17,9 +21,18 @@ import {
 } from "./StateJourney";
 import { MarkdownAnswer } from "./MarkdownAnswer";
 import { useSentiaStore } from "./store";
+import {
+  DEEPGRAM_AUTO_SUBMIT_DELAY_MS,
+  resolveVoiceTurnAction,
+} from "./voiceSubmission";
 
 interface AppProps {
   bridge: EditorBridge;
+}
+
+interface PendingVoiceSubmission {
+  transcript: string;
+  turnKey: string;
 }
 
 export function App({ bridge }: AppProps) {
@@ -27,6 +40,9 @@ export function App({ bridge }: AppProps) {
   const [question, setQuestion] = useState("What is this codebase about?");
   const [activeRequestId, setActiveRequestId] = useState<string | null>(null);
   const [voiceSessionId, setVoiceSessionId] = useState<string | null>(null);
+  const [voiceSubmitRequested, setVoiceSubmitRequested] = useState(false);
+  const [pendingVoiceSubmission, setPendingVoiceSubmission] =
+    useState<PendingVoiceSubmission | null>(null);
   const submittedVoiceTurnsRef = useRef(new Set<string>());
   const {
     agent,
@@ -40,6 +56,8 @@ export function App({ bridge }: AppProps) {
     workspaceName,
     workspaceTrusted,
     voiceError,
+    openaiVoice,
+    voiceProvider,
     voiceStatus,
     voiceTranscript,
   } = useSentiaStore();
@@ -58,6 +76,10 @@ export function App({ bridge }: AppProps) {
   const agentConnected = agent.connection?.connected === true;
   const providerName =
     agent.selectedProvider === "claude" ? "Claude Code" : "Codex";
+  const voiceConnected =
+    voiceProvider === "deepgram" ? deepgram.connected : openaiVoice.connected;
+  const voiceProviderName =
+    voiceProvider === "deepgram" ? "Deepgram Flux" : "OpenAI Voice";
 
   function selectAgent(provider: AgentProvider): void {
     bridge.post({
@@ -93,6 +115,24 @@ export function App({ bridge }: AppProps) {
     bridge.post({ type: "deepgram.connect", requestId: crypto.randomUUID() });
   }
 
+  function connectOpenAIVoice(): void {
+    bridge.post({
+      type: "openai_voice.connect",
+      requestId: crypto.randomUUID(),
+    });
+  }
+
+  function selectVoiceProvider(provider: VoiceProvider): void {
+    if (voiceSessionId) {
+      cancelVoiceCapture();
+    }
+    bridge.post({
+      type: "voice.provider.select",
+      requestId: crypto.randomUUID(),
+      provider,
+    });
+  }
+
   const submitQuestion = useCallback(
     (value: string, responseMode: "text" | "voice" = "text"): string | null => {
       const normalized = value.trim();
@@ -114,34 +154,51 @@ export function App({ bridge }: AppProps) {
 
   function askRepository(event: FormEvent): void {
     event.preventDefault();
+    if (voiceSessionId) {
+      return;
+    }
     submitQuestion(question);
   }
 
-  const stopVoiceCapture = useCallback(
-    (cancel = false): void => {
-      const sessionId = voiceSessionId;
-      if (sessionId) {
-        bridge.post({
-          type: cancel ? "voice.cancel" : "voice.stop",
-          requestId: crypto.randomUUID(),
-          sessionId,
-        });
-      }
-      setVoiceSessionId(null);
-    },
-    [bridge, voiceSessionId],
-  );
+  const cancelVoiceCapture = useCallback((): void => {
+    const sessionId = voiceSessionId;
+    if (sessionId) {
+      bridge.post({
+        type: "voice.cancel",
+        requestId: crypto.randomUUID(),
+        sessionId,
+      });
+    }
+    setPendingVoiceSubmission(null);
+    setVoiceSubmitRequested(false);
+    setVoiceSessionId(null);
+  }, [bridge, voiceSessionId]);
 
-  function startVoice(): void {
-    if (!deepgram.connected) {
-      connectDeepgram();
+  const finishVoiceCapture = useCallback((): void => {
+    const sessionId = voiceSessionId;
+    if (!sessionId || voiceSubmitRequested) {
       return;
     }
-    if (voiceSessionId) {
-      stopVoiceCapture();
+    setVoiceSubmitRequested(true);
+    bridge.post({
+      type: "voice.stop",
+      requestId: crypto.randomUUID(),
+      sessionId,
+    });
+  }, [bridge, voiceSessionId, voiceSubmitRequested]);
+
+  function startVoice(): void {
+    if (!voiceConnected) {
+      if (voiceProvider === "deepgram") {
+        connectDeepgram();
+      } else {
+        connectOpenAIVoice();
+      }
       return;
     }
     const sessionId = crypto.randomUUID();
+    setPendingVoiceSubmission(null);
+    setVoiceSubmitRequested(false);
     setVoiceSessionId(sessionId);
     bridge.post({
       type: "voice.start",
@@ -150,6 +207,20 @@ export function App({ bridge }: AppProps) {
     });
   }
 
+  const submitVoiceTurn = useCallback(
+    (turn: PendingVoiceSubmission): void => {
+      if (submittedVoiceTurnsRef.current.has(turn.turnKey)) {
+        return;
+      }
+      submittedVoiceTurnsRef.current.add(turn.turnKey);
+      setPendingVoiceSubmission(null);
+      setVoiceSubmitRequested(false);
+      setVoiceSessionId(null);
+      submitQuestion(turn.transcript, "voice");
+    },
+    [submitQuestion],
+  );
+
   useEffect(() => {
     if (!voiceTranscript || voiceTranscript.sessionId !== voiceSessionId) {
       return;
@@ -157,21 +228,66 @@ export function App({ bridge }: AppProps) {
     if (voiceTranscript.correctedTranscript) {
       setQuestion(voiceTranscript.correctedTranscript);
     }
-    if (
-      !voiceTranscript.isFinal ||
-      !voiceTranscript.correctedTranscript.trim()
-    ) {
-      return;
-    }
     const turnKey = `${voiceTranscript.sessionId}:${String(voiceTranscript.turnIndex)}`;
     if (submittedVoiceTurnsRef.current.has(turnKey)) {
       return;
     }
-    submittedVoiceTurnsRef.current.add(turnKey);
-    stopVoiceCapture();
-    setVoiceSessionId(null);
-    submitQuestion(voiceTranscript.correctedTranscript, "voice");
-  }, [stopVoiceCapture, submitQuestion, voiceSessionId, voiceTranscript]);
+    const turn = {
+      turnKey,
+      transcript: voiceTranscript.correctedTranscript,
+    };
+    const action = resolveVoiceTurnAction({
+      provider: voiceProvider,
+      submitRequested: voiceSubmitRequested,
+      isFinal: voiceTranscript.isFinal,
+      transcript: voiceTranscript.correctedTranscript,
+    });
+    if (action === "submit") {
+      submitVoiceTurn(turn);
+      return;
+    }
+    if (action !== "queue" || pendingVoiceSubmission) {
+      return;
+    }
+    setPendingVoiceSubmission(turn);
+    bridge.post({
+      type: "voice.stop",
+      requestId: crypto.randomUUID(),
+      sessionId: voiceTranscript.sessionId,
+    });
+  }, [
+    bridge,
+    pendingVoiceSubmission,
+    submitVoiceTurn,
+    voiceProvider,
+    voiceSessionId,
+    voiceSubmitRequested,
+    voiceTranscript,
+  ]);
+
+  useEffect(() => {
+    if (!pendingVoiceSubmission) {
+      return;
+    }
+    const timer = window.setTimeout(() => {
+      submitVoiceTurn(pendingVoiceSubmission);
+    }, DEEPGRAM_AUTO_SUBMIT_DELAY_MS);
+    return () => window.clearTimeout(timer);
+  }, [pendingVoiceSubmission, submitVoiceTurn]);
+
+  useEffect(() => {
+    if (
+      voiceSubmitRequested &&
+      voiceStatus?.sessionId === voiceSessionId &&
+      voiceStatus.state === "closed"
+    ) {
+      const timer = window.setTimeout(() => {
+        setVoiceSubmitRequested(false);
+        setVoiceSessionId(null);
+      }, 500);
+      return () => window.clearTimeout(timer);
+    }
+  }, [voiceSessionId, voiceStatus, voiceSubmitRequested]);
 
   function openEvidence(evidence: EvidenceRange): void {
     bridge.post({
@@ -359,31 +475,92 @@ export function App({ bridge }: AppProps) {
           </section>
 
           <form className="question-card" onSubmit={askRepository}>
+            <div className="voice-provider-row">
+              <span>Voice provider</span>
+              <div
+                aria-label="Voice provider"
+                className="voice-provider-toggle"
+              >
+                <button
+                  aria-pressed={voiceProvider === "deepgram"}
+                  disabled={Boolean(voiceSessionId) || asking}
+                  onClick={() => selectVoiceProvider("deepgram")}
+                  type="button"
+                >
+                  Deepgram
+                </button>
+                <button
+                  aria-pressed={voiceProvider === "openai"}
+                  disabled={Boolean(voiceSessionId) || asking}
+                  onClick={() => selectVoiceProvider("openai")}
+                  type="button"
+                >
+                  OpenAI
+                </button>
+              </div>
+            </div>
+            {voiceProvider === "openai" ? (
+              <p className="voice-disclosure">
+                Spoken output uses an AI-generated OpenAI voice. An OpenAI API
+                key with billing is required separately from ChatGPT or Codex.
+              </p>
+            ) : null}
             <div className="question-card__heading">
               <label htmlFor="sentia-question">Ask the codebase</label>
-              <button
-                aria-label={
-                  voiceSessionId ? "Stop listening" : "Ask with voice"
-                }
-                className={clsx(
-                  "voice-button",
-                  voiceSessionId && "is-listening",
-                )}
-                disabled={!workspaceTrusted || asking}
-                onClick={() => void startVoice()}
-                title={
-                  deepgram.connected
-                    ? "Ask with Deepgram Flux"
-                    : "Connect Deepgram Flux"
-                }
-                type="button"
-              >
-                {voiceSessionId
-                  ? "Stop"
-                  : deepgram.connected
-                    ? "Mic"
-                    : "Connect voice"}
-              </button>
+              <div className="voice-actions">
+                <button
+                  aria-label={
+                    pendingVoiceSubmission
+                      ? "Send speech now"
+                      : voiceSessionId
+                        ? "Stop and submit speech"
+                        : "Ask with voice"
+                  }
+                  className={clsx(
+                    "voice-button",
+                    voiceSessionId && "is-listening",
+                  )}
+                  disabled={!workspaceTrusted || asking || voiceSubmitRequested}
+                  onClick={() =>
+                    pendingVoiceSubmission
+                      ? submitVoiceTurn(pendingVoiceSubmission)
+                      : voiceSessionId
+                        ? finishVoiceCapture()
+                        : void startVoice()
+                  }
+                  title={
+                    pendingVoiceSubmission
+                      ? "Submit the detected Deepgram turn now"
+                      : voiceSessionId
+                        ? "Stop listening and ask Sentia"
+                        : voiceConnected
+                          ? `Ask with ${voiceProviderName}`
+                          : `Connect ${voiceProviderName}`
+                  }
+                  type="button"
+                >
+                  {voiceSessionId
+                    ? pendingVoiceSubmission
+                      ? "Send now"
+                      : voiceSubmitRequested
+                        ? "Finishing…"
+                        : "Stop"
+                    : voiceConnected
+                      ? "Mic"
+                      : `Connect ${voiceProvider === "deepgram" ? "Deepgram" : "OpenAI"}`}
+                </button>
+                {voiceSessionId ? (
+                  <button
+                    aria-label="Cancel and discard speech"
+                    className="voice-cancel-button"
+                    onClick={cancelVoiceCapture}
+                    title="Discard this recording without asking Sentia"
+                    type="button"
+                  >
+                    Cancel
+                  </button>
+                ) : null}
+              </div>
             </div>
             <textarea
               id="sentia-question"
@@ -395,12 +572,16 @@ export function App({ bridge }: AppProps) {
             />
             <button
               className="primary-button"
-              disabled={asking || !workspaceTrusted}
+              disabled={asking || !workspaceTrusted || Boolean(voiceSessionId)}
               type="submit"
             >
               {asking ? "Reading codebase…" : "Ask Sentia"}
             </button>
-            {voiceSessionId && voiceStatus?.sessionId === voiceSessionId ? (
+            {pendingVoiceSubmission ? (
+              <p className="voice-status" aria-live="polite">
+                End of turn detected. Sending in two seconds—Cancel to discard.
+              </p>
+            ) : voiceSessionId && voiceStatus?.sessionId === voiceSessionId ? (
               <p className="voice-status" aria-live="polite">
                 {voiceStatus.message ?? "Listening…"}
               </p>

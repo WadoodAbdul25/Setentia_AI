@@ -104,6 +104,23 @@ describe("Sentia protocol", () => {
     ).toMatchObject({ type: "agent.status" });
   });
 
+  it("accepts switching to OpenAI Voice", () => {
+    expect(
+      webviewToExtensionMessageSchema.parse({
+        type: "voice.provider.select",
+        requestId: "req_voice_provider",
+        provider: "openai",
+      }),
+    ).toMatchObject({ provider: "openai" });
+
+    expect(
+      extensionToWebviewMessageSchema.parse({
+        type: "openai_voice.status",
+        payload: { connected: true, message: "OpenAI Voice is connected." },
+      }),
+    ).toMatchObject({ type: "openai_voice.status" });
+  });
+
   it("accepts nullable evidence labels emitted by the Python sidecar", () => {
     const message = extensionToWebviewMessageSchema.parse({
       type: "repository.answer",

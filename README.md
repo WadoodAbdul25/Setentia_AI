@@ -11,8 +11,8 @@ reports verified progress in a conversational voice.
 
 Sentia is delivered as a VS Code extension. It coordinates three capabilities:
 
-- **Deepgram Flux** provides turn-aware streaming voice input and natural,
-  conversational speech output.
+- **Deepgram Flux or OpenAI Voice** provides streaming voice input and natural,
+  AI-generated speech output; the user can switch providers in the composer.
 - **The Sentia editor extension** hosts the interface, understands editor
   context, and controls the workflow.
 - **Claude Code or Codex** inspects, edits, and tests the code after the user
@@ -72,9 +72,10 @@ will:
 - Open files, reveal ranges, and highlight relevant code in VS Code-compatible
   editors.
 - Capture microphone audio through a native macOS helper and transcribe it
-  through Deepgram Flux with repository-aware keyterms and spelling correction.
+  through Deepgram Flux or OpenAI live transcription with repository-aware
+  vocabulary and spelling correction.
 - Keep detailed visual answers separate from faithful, second-stage AI speech
-  renderings synthesized through Deepgram Flux TTS.
+  renderings synthesized through the selected voice provider.
 - Turn a discussion into a plan and require approval before coding begins.
 - Run Claude Code through a controlled adapter and stream structured progress.
 - Show changed files, diffs, commands, and test results.
@@ -306,6 +307,17 @@ to explain its own codebase. Inside the development host, **Sentia: Open** is
 available from the Command Palette; the **Run Sentia Extension** launch command
 remains in the original development window because it owns the debugger.
 
+On macOS, bypass the function keys and launch the complete development
+extension directly from the repository:
+
+```bash
+npm start
+```
+
+This builds Sentia and opens a fresh VS Code Extension Development Host with the
+local extension loaded. The launcher reports a setup error if the Python
+sidecar or Visual Studio Code installation cannot be found.
+
 ## Anthropic setup for live answers
 
 You need an Anthropic Console API key with active API billing or credits. A
@@ -344,9 +356,33 @@ Sentia appends `/v2/listen` and declares its native 16 kHz linear PCM microphone
 stream. Sentia then gives the completed, validated display answer to a separate
 AI speech-rendering pass. That pass preserves its claims, qualifications, steps,
 and technical relationships while removing Markdown, citations, paths, and raw
-code notation. Sentia sends only that derived version to Deepgram Flux TTS at
+code notation. Sentia streams only that derived version to Deepgram Flux TTS at
 `/v2/speak`; the complete evidence-backed answer remains visible on screen. The default TTS voice is
-`flux-marcus-en` and can be changed with `sentia.voice.deepgramTtsModel`.
+`flux-bruce-en` and can be changed with `sentia.voice.deepgramTtsModel`. Sentia keeps one Flux TTS
+WebSocket open across spoken turns so Deepgram can preserve conversational prosody. If explicit
+speed control is required, choose an `aura-2-*` model instead and set
+`sentia.voice.deepgramTtsSpeed`; Aura uses `/v1/speak` and does not provide Flux cross-turn context.
+
+## OpenAI Voice setup
+
+Choose **OpenAI** under **Voice provider**, then select **Connect OpenAI** on the
+microphone button and paste an OpenAI Platform API key. This key is separate
+from a ChatGPT subscription and from the Codex browser login. Sentia stores it
+in VS Code SecretStorage; it is never sent to the webview or written to the
+repository.
+
+OpenAI mode opens `wss://api.openai.com/v1/realtime?model=gpt-realtime`, then
+configures `gpt-live-transcribe` for input transcription of the native 24 kHz PCM stream to
+text. Sentia's already-selected coding agent produces the one authoritative
+repository answer, and
+`gpt-4o-mini-tts` speaks the faithful speech rendering of that same answer.
+The full answer and evidence remain visible. The default voice is `marin`; use
+`sentia.voice.openaiVoice` to change it. Sentia labels the output as
+AI-generated in the interface. OpenAI input is push-to-talk: choose **Stop** to
+submit the recording or **Cancel** to discard it without asking the codebase.
+Deepgram Flux automatically queues a detected end-of-turn for voice submission
+after a two-second safety window; choose **Cancel** to discard it or **Send now**
+to submit immediately.
 
 ## Coding-agent SDK setup
 

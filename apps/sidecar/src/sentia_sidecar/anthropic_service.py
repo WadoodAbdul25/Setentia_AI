@@ -19,6 +19,7 @@ from claude_agent_sdk import (
     AssistantMessage,
     ClaudeAgentOptions,
     ResultMessage,
+    StreamEvent,
     ToolUseBlock,
     query,
 )
@@ -39,6 +40,7 @@ from sentia_sidecar.repository_intelligence import (
     SpeechAnswer,
     bounded_text,
     speech_render_prompt,
+    speech_stream_prompt,
     validate_evidence,
 )
 
@@ -257,6 +259,87 @@ class AnthropicRepositoryService:
         speech, _ = await self._render_speech(answer, workspace_path, diagnostic_id)
         return speech
 
+    async def stream_speech(
+        self,
+        answer: str,
+        workspace_path: Path,
+    ) -> AsyncIterator[str]:
+        if self._api_key is None:
+            raise AnthropicServiceError("Connect an Anthropic API key before asking Sentia.", 409)
+        diagnostic_id = f"sentia_{uuid4().hex[:12]}"
+        options = ClaudeAgentOptions(
+            tools=[],
+            allowed_tools=[],
+            disallowed_tools=[
+                "Read",
+                "Glob",
+                "Grep",
+                "Edit",
+                "Write",
+                "Bash",
+                "NotebookEdit",
+                "WebFetch",
+                "WebSearch",
+                "Task",
+            ],
+            system_prompt=SPEECH_SYSTEM_PROMPT,
+            mcp_servers={},
+            strict_mcp_config=True,
+            permission_mode="dontAsk",
+            cwd=workspace_path,
+            env={"ANTHROPIC_API_KEY": self._api_key},
+            max_turns=1,
+            model=self.model,
+            setting_sources=[],
+            include_partial_messages=True,
+        )
+        emitted = 0
+        result_message: ResultMessage | None = None
+        try:
+            async for message in self._query(
+                prompt=speech_stream_prompt(answer),
+                options=options,
+            ):
+                if isinstance(message, StreamEvent):
+                    delta = _speech_text_delta(message)
+                    if not delta:
+                        continue
+                    remaining = 3_000 - emitted
+                    if remaining <= 0:
+                        break
+                    chunk = delta[:remaining]
+                    emitted += len(chunk)
+                    yield chunk
+                    if len(chunk) < len(delta):
+                        break
+                    continue
+                if isinstance(message, ResultMessage):
+                    result_message = message
+        except Exception as error:
+            raise AnthropicServiceError(
+                "Claude could not stream the validated answer for speech. "
+                f"Diagnostic ID: {diagnostic_id}."
+            ) from error
+        if result_message is None and emitted < 3_000:
+            raise AnthropicServiceError(
+                f"Claude ended without a speech rendering. Diagnostic ID: {diagnostic_id}."
+            )
+        if result_message is not None and (
+            result_message.is_error or result_message.subtype != "success"
+        ):
+            raise AnthropicServiceError(
+                "Claude could not stream the validated answer for speech. "
+                f"Diagnostic ID: {diagnostic_id}."
+            )
+        if emitted == 0 and result_message is not None:
+            fallback = result_message.result
+            if isinstance(fallback, str) and fallback.strip():
+                yield fallback[:3_000]
+                return
+            raise AnthropicServiceError(
+                f"Claude returned an empty speech rendering. Diagnostic ID: {diagnostic_id}."
+            )
+
     async def _render_speech(
         self,
         answer: str,
@@ -341,6 +424,17 @@ def _repository_agent_prompt(question: str, manifest: RepositoryManifest) -> str
         "ideation. Choose recommendedMode=build only when the user asks to plan, implement, fix, "
         "add, remove, refactor, or test a concrete change."
     )
+
+
+def _speech_text_delta(message: StreamEvent) -> str | None:
+    event = message.event
+    if event.get("type") != "content_block_delta":
+        return None
+    delta = event.get("delta")
+    if not isinstance(delta, dict) or delta.get("type") != "text_delta":
+        return None
+    text = delta.get("text")
+    return text if isinstance(text, str) and text else None
 
 
 def _agent_result_error(
