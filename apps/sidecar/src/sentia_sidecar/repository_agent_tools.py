@@ -1,3 +1,4 @@
+# The Claude Adapter. -  Look at Codex_service.py for Codex Adapter
 from __future__ import annotations
 
 import asyncio
@@ -23,6 +24,7 @@ DEFAULT_SEARCH_LIMIT = 12
 MAX_SEARCH_LIMIT = 20
 
 _STOP_WORDS = {
+    "architecture",
     "about",
     "and",
     "are",
@@ -48,11 +50,14 @@ _STOP_WORDS = {
     "them",
     "this",
     "those",
+    "techstack",
     "what",
     "where",
     "which",
     "with",
     "you",
+    
+    
 }
 _ALIASES = {
     "agent": {"ai", "graph", "llm", "provider", "router"},
