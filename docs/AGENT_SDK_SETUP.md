@@ -5,10 +5,10 @@ adapter. Do not paste keys into source files, `.env` files inside a codebase, or
 chat messages.
 
 The provider selected in the Sentia sidebar is used for both repository
-questions and coding-agent runs. Claude repository questions use one read-only
-Claude Agent SDK investigation with custom tools backed by Sentia's cached,
-ignore-aware snapshot. Codex repository questions use two ephemeral, read-only
-Codex SDK threads around Sentia's bounded local evidence reader.
+questions and coding-agent runs. Both repository-question adapters use bounded,
+read-only selection and answer turns around Sentia's cached, ignore-aware
+manifest and local evidence reader. Claude uses two Claude Agent SDK queries;
+Codex uses two ephemeral Codex SDK threads.
 
 ## Install the Python environment
 

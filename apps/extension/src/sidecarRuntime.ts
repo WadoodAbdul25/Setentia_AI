@@ -72,6 +72,7 @@ export class SidecarRuntime implements vscode.Disposable {
   private token: string | undefined;
   private port: number | undefined;
   private lastSequence = 0;
+  private nextHttpRequestId = 1;
   private stopping = false;
   private status: SidecarStatus = {
     status: "stopped",
@@ -410,16 +411,36 @@ export class SidecarRuntime implements vscode.Disposable {
     provider: AgentProvider,
   ): AsyncGenerator<string> {
     await this.start();
-    const response = await fetch(
-      `http://127.0.0.1:${String(this.port)}/api/v1/voice/render/stream`,
-      {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${this.token ?? ""}`,
-          "Content-Type": "application/json",
+    const requestId = this.nextHttpRequestId++;
+    const pathname = "/api/v1/voice/render/stream";
+    const startedAt = performance.now();
+    const logPayloads = vscode.workspace
+      .getConfiguration("sentia.development")
+      .get<boolean>("logVoicePayloads", false);
+    this.output.appendLine(
+      `[http:request] id=${String(requestId)} method=POST path=${pathname} provider=${provider} answerCharacters=${String(answer.length)} streaming=true`,
+    );
+    let response: Response;
+    try {
+      response = await fetch(
+        `http://127.0.0.1:${String(this.port)}${pathname}`,
+        {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${this.token ?? ""}`,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({ workspacePath, answer, provider }),
         },
-        body: JSON.stringify({ workspacePath, answer, provider }),
-      },
+      );
+    } catch (error) {
+      this.output.appendLine(
+        `[http:error] id=${String(requestId)} path=${pathname} elapsedMs=${(performance.now() - startedAt).toFixed(1)} error=${JSON.stringify(error instanceof Error ? error.message : String(error))}`,
+      );
+      throw error;
+    }
+    this.output.appendLine(
+      `[http:response] id=${String(requestId)} path=${pathname} status=${String(response.status)} contentType=${JSON.stringify(response.headers.get("content-type"))} headersMs=${(performance.now() - startedAt).toFixed(1)} streaming=true`,
     );
     if (!response.ok) {
       const payload = await readResponseJson(response);
@@ -442,6 +463,9 @@ export class SidecarRuntime implements vscode.Disposable {
     const decoder = new TextDecoder();
     let pending = "";
     let completed = false;
+    let deltaCount = 0;
+    let outputCharacters = 0;
+    let firstDeltaAt: number | undefined;
     try {
       while (true) {
         const { done, value } = await reader.read();
@@ -451,8 +475,19 @@ export class SidecarRuntime implements vscode.Disposable {
         for (const line of lines) {
           const event = parseSpeechStreamEvent(line);
           if (event.type === "delta") {
+            deltaCount += 1;
+            outputCharacters += event.text.length;
+            if (firstDeltaAt === undefined) {
+              firstDeltaAt = performance.now();
+            }
+            this.output.appendLine(
+              `[http:stream] id=${String(requestId)} event=delta index=${String(deltaCount)} characters=${String(event.text.length)} totalCharacters=${String(outputCharacters)}${logPayloads ? ` text=${JSON.stringify(event.text)}` : ""}`,
+            );
             yield event.text;
           } else if (event.type === "error") {
+            this.output.appendLine(
+              `[http:stream] id=${String(requestId)} event=error message=${JSON.stringify(event.message)}`,
+            );
             throw new Error(event.message);
           } else {
             completed = true;
@@ -465,8 +500,19 @@ export class SidecarRuntime implements vscode.Disposable {
       if (pending.trim()) {
         const event = parseSpeechStreamEvent(pending);
         if (event.type === "delta") {
+          deltaCount += 1;
+          outputCharacters += event.text.length;
+          if (firstDeltaAt === undefined) {
+            firstDeltaAt = performance.now();
+          }
+          this.output.appendLine(
+            `[http:stream] id=${String(requestId)} event=delta index=${String(deltaCount)} characters=${String(event.text.length)} totalCharacters=${String(outputCharacters)}${logPayloads ? ` text=${JSON.stringify(event.text)}` : ""}`,
+          );
           yield event.text;
         } else if (event.type === "error") {
+          this.output.appendLine(
+            `[http:stream] id=${String(requestId)} event=error message=${JSON.stringify(event.message)}`,
+          );
           throw new Error(event.message);
         } else {
           completed = true;
@@ -475,6 +521,9 @@ export class SidecarRuntime implements vscode.Disposable {
       if (!completed) {
         throw new Error("Speech rendering ended before its completion event.");
       }
+      this.output.appendLine(
+        `[http:stream-complete] id=${String(requestId)} deltas=${String(deltaCount)} outputCharacters=${String(outputCharacters)} firstDeltaMs=${firstDeltaAt === undefined ? "none" : (firstDeltaAt - startedAt).toFixed(1)} totalMs=${(performance.now() - startedAt).toFixed(1)}`,
+      );
     } finally {
       reader.releaseLock();
     }
@@ -690,17 +739,44 @@ export class SidecarRuntime implements vscode.Disposable {
     schema: ResponseSchema<T>,
   ): Promise<T> {
     await this.start();
-    const response = await fetch(
-      `http://127.0.0.1:${String(this.port)}${pathname}`,
-      {
-        ...init,
-        headers: {
-          ...init.headers,
-          Authorization: `Bearer ${this.token ?? ""}`,
-        },
-      },
+    const requestId = this.nextHttpRequestId++;
+    const method = init.method ?? "GET";
+    const startedAt = performance.now();
+    const bodyCharacters =
+      typeof init.body === "string" ? init.body.length : undefined;
+    this.output.appendLine(
+      `[http:request] id=${String(requestId)} method=${method} path=${pathname}${bodyCharacters === undefined ? "" : ` bodyCharacters=${String(bodyCharacters)}`}`,
     );
-    const payload = await readResponseJson(response);
+    let response: Response;
+    try {
+      response = await fetch(
+        `http://127.0.0.1:${String(this.port)}${pathname}`,
+        {
+          ...init,
+          headers: {
+            ...init.headers,
+            Authorization: `Bearer ${this.token ?? ""}`,
+          },
+        },
+      );
+    } catch (error) {
+      this.output.appendLine(
+        `[http:error] id=${String(requestId)} path=${pathname} elapsedMs=${(performance.now() - startedAt).toFixed(1)} error=${JSON.stringify(error instanceof Error ? error.message : String(error))}`,
+      );
+      throw error;
+    }
+    this.output.appendLine(
+      `[http:response] id=${String(requestId)} path=${pathname} status=${String(response.status)} contentType=${JSON.stringify(response.headers.get("content-type"))} elapsedMs=${(performance.now() - startedAt).toFixed(1)}`,
+    );
+    let payload: unknown;
+    try {
+      payload = await readResponseJson(response);
+    } catch (error) {
+      this.output.appendLine(
+        `[http:error] id=${String(requestId)} path=${pathname} stage=response_parse error=${JSON.stringify(error instanceof Error ? error.message : String(error))}`,
+      );
+      throw error;
+    }
     if (!response.ok) {
       const detail =
         typeof payload === "object" &&
@@ -711,7 +787,18 @@ export class SidecarRuntime implements vscode.Disposable {
           : `Sentia request failed (${String(response.status)})`;
       throw new Error(detail);
     }
-    return schema.parse(payload);
+    try {
+      const parsed = schema.parse(payload);
+      this.output.appendLine(
+        `[http:complete] id=${String(requestId)} path=${pathname} totalMs=${(performance.now() - startedAt).toFixed(1)}`,
+      );
+      return parsed;
+    } catch (error) {
+      this.output.appendLine(
+        `[http:error] id=${String(requestId)} path=${pathname} stage=schema_validation error=${JSON.stringify(error instanceof Error ? error.message : String(error))}`,
+      );
+      throw error;
+    }
   }
 }
 

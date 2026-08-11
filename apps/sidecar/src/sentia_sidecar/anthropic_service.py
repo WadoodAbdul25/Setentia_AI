@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import time
 from collections.abc import AsyncIterator, Callable
 from pathlib import Path
@@ -16,25 +17,27 @@ from anthropic import (
     RateLimitError,
 )
 from claude_agent_sdk import (
-    AssistantMessage,
     ClaudeAgentOptions,
     ResultMessage,
     StreamEvent,
-    ToolUseBlock,
     query,
 )
 from pydantic import ValidationError
 from structlog.typing import FilteringBoundLogger
 
 from sentia_sidecar.protocol import AgentProvider, RepositoryAnswer, TokenUsage
-from sentia_sidecar.repository import RepositoryManifest
-from sentia_sidecar.repository_agent_tools import (
-    RepositoryAgentTools,
-    repository_snapshot_summary,
+from sentia_sidecar.repository import (
+    MAX_SELECTED_FILES,
+    RepositoryError,
+    RepositoryManifest,
+    build_selected_repository_context,
+    expand_repository_selection,
 )
 from sentia_sidecar.repository_intelligence import (
+    SELECTION_SYSTEM_PROMPT,
     SPEECH_SYSTEM_PROMPT,
     SYSTEM_PROMPT,
+    FileSelection,
     ModelAnswer,
     RepositoryIntelligenceError,
     SpeechAnswer,
@@ -46,24 +49,9 @@ from sentia_sidecar.repository_intelligence import (
 
 logger = structlog.get_logger(__name__)
 
-CLAUDE_REPOSITORY_SYSTEM_PROMPT = (
-    SYSTEM_PROMPT
-    + """
-You are running as a read-only repository investigation agent. Sentia has already built and cached
-an eligible-file snapshot using the workspace ignore rules. Use only the provided
-search_repository and read_repository_file tools. Start with focused searches over cached paths and
-symbol outlines, including likely aliases (for example Claude/Anthropic or agent/LLM/provider).
-Read the implementation files needed for the question; do not answer from filenames or outlines
-alone. Every cited file must first be read through read_repository_file. Prefer outline mode while
-orienting and full mode when the user asks what functions actually do. Stop once the evidence is
-sufficient. Never attempt to edit files, invoke shell commands, access the network, or read paths
-outside Sentia's eligible snapshot."""
-)
-SEARCH_TOOL = "mcp__sentia_repository__search_repository"
-READ_TOOL = "mcp__sentia_repository__read_repository_file"
+CONTENT_RETRIEVAL_TIMEOUT_SECONDS = 15.0
 
 QueryFunction = Callable[..., AsyncIterator[Any]]
-ToolsFactory = Callable[[RepositoryManifest], RepositoryAgentTools]
 
 
 class AnthropicServiceError(RepositoryIntelligenceError):
@@ -78,12 +66,10 @@ class AnthropicRepositoryService:
         model: str,
         *,
         query_function: QueryFunction = query,
-        tools_factory: ToolsFactory = RepositoryAgentTools,
     ) -> None:
         self.model = model
         self._api_key: str | None = None
         self._query = query_function
-        self._tools_factory = tools_factory
 
     @property
     def connected(self) -> bool:
@@ -114,10 +100,9 @@ class AnthropicRepositoryService:
         if self._api_key is None:
             raise AnthropicServiceError("Connect an Anthropic API key before asking Sentia.", 409)
         diagnostic_id = f"sentia_{uuid4().hex[:12]}"
-        stage = "agent_scan"
+        stage = "file_selection"
         total_started = time.perf_counter()
         request_logger = logger.bind(diagnostic_id=diagnostic_id, model=self.model)
-        repository_tools = self._tools_factory(manifest)
         request_logger.info(
             "repository_question_started",
             manifest_files=manifest.files_scanned,
@@ -127,82 +112,107 @@ class AnthropicRepositoryService:
             runtime="claude_agent_sdk",
         )
 
-        options = ClaudeAgentOptions(
-            tools=[],
-            allowed_tools=[SEARCH_TOOL, READ_TOOL],
-            disallowed_tools=[
-                "Read",
-                "Glob",
-                "Grep",
-                "Edit",
-                "Write",
-                "Bash",
-                "NotebookEdit",
-                "WebFetch",
-                "WebSearch",
-                "Task",
-            ],
-            system_prompt=CLAUDE_REPOSITORY_SYSTEM_PROMPT,
-            mcp_servers={"sentia_repository": repository_tools.server},
-            strict_mcp_config=True,
-            permission_mode="dontAsk",
-            cwd=manifest.root,
-            env={"ANTHROPIC_API_KEY": self._api_key},
-            max_turns=10,
-            model=self.model,
-            setting_sources=[],
-            output_format={
-                "type": "json_schema",
-                "schema": ModelAnswer.model_json_schema(by_alias=True),
-            },
-        )
-        result_message: ResultMessage | None = None
-        agent_started = time.perf_counter()
         try:
-            async for message in self._query(
-                prompt=_repository_agent_prompt(question, manifest),
-                options=options,
-            ):
-                if isinstance(message, AssistantMessage):
-                    for block in message.content:
-                        if isinstance(block, ToolUseBlock):
-                            request_logger.info(
-                                "repository_agent_tool_started",
-                                tool=block.name,
-                            )
-                elif isinstance(message, ResultMessage):
-                    result_message = message
-        except AnthropicServiceError as error:
-            _log_processing_error(request_logger, stage, error)
-            raise
-        except Exception as error:
-            if result_message is not None and result_message.is_error:
-                result_error = _agent_result_error(result_message, diagnostic_id)
-                _log_processing_error(request_logger, stage, result_error)
-                raise result_error from error
+            selection_started = time.perf_counter()
+            selection_result = await self._run_structured_turn(
+                prompt=(
+                    f"QUESTION:\n{question.strip()}\n\n"
+                    f"{manifest.prompt}\n\n"
+                    f"Select no more than {MAX_SELECTED_FILES} files. Return a short "
+                    "selection report with a read mode and reason for each file."
+                ),
+                system_prompt=SELECTION_SYSTEM_PROMPT,
+                response_schema=FileSelection.model_json_schema(by_alias=True),
+                workspace_path=manifest.root,
+                diagnostic_id=diagnostic_id,
+                stage=stage,
+            )
+            selection = FileSelection.model_validate(selection_result.structured_output)
+            selection_elapsed_ms = _elapsed_ms(selection_started)
+            requested = expand_repository_selection(
+                manifest,
+                [(choice.path, choice.read_mode) for choice in selection.files],
+                question,
+            )
+            request_logger.info(
+                "shortlist_agent_completed",
+                selected_count=len(selection.files),
+                selected_files=[choice.path for choice in selection.files],
+                expanded_count=len(requested),
+                expanded_files=[path for path, _ in requested],
+                read_modes=[choice.read_mode for choice in selection.files],
+                elapsed_ms=selection_elapsed_ms,
+                session_id=selection_result.session_id,
+                turns=selection_result.num_turns,
+                runtime="claude_agent_sdk",
+            )
+
+            stage = "content_read"
+            read_started = time.perf_counter()
+            try:
+                async with asyncio.timeout(CONTENT_RETRIEVAL_TIMEOUT_SECONDS):
+                    repository = await asyncio.to_thread(
+                        build_selected_repository_context,
+                        manifest,
+                        requested,
+                    )
+            except TimeoutError as error:
+                raise AnthropicServiceError(
+                    "Sentia's content reader exceeded 15 seconds. Try a narrower question.",
+                    504,
+                ) from error
+            content_read_elapsed_ms = _elapsed_ms(read_started)
+            request_logger.info(
+                "content_reader_completed",
+                evidence_chars=len(repository.prompt),
+                files_read=repository.files_read,
+                selected_files=list(repository.selected_files),
+                elapsed_ms=content_read_elapsed_ms,
+                timeout_seconds=CONTENT_RETRIEVAL_TIMEOUT_SECONDS,
+            )
+
+            selection_report = "\n".join(
+                f"- {choice.path} ({choice.read_mode}): {choice.reason}"
+                for choice in selection.files
+                if choice.path in manifest.files
+            )
+            stage = "repository_answer"
+            answer_started = time.perf_counter()
+            answer_result = await self._run_structured_turn(
+                prompt=(
+                    f"QUESTION:\n{question.strip()}\n\n"
+                    f"FILE-SELECTION REPORT:\n{selection.rationale}\n"
+                    f"{selection_report}\n\n"
+                    f"{repository.prompt}\n\n"
+                    "Return one coherent answer plus the smallest useful set of citations. "
+                    "Choose recommendedMode=brainstorm for explanation, exploration, "
+                    "questions, or open-ended ideation. Choose recommendedMode=build when "
+                    "the user asks to plan, implement, fix, add, remove, refactor, or "
+                    "test a concrete change. Briefly explain that routing choice in "
+                    "modeReason."
+                ),
+                system_prompt=SYSTEM_PROMPT,
+                response_schema=ModelAnswer.model_json_schema(by_alias=True),
+                workspace_path=manifest.root,
+                diagnostic_id=diagnostic_id,
+                stage=stage,
+            )
+            draft = ModelAnswer.model_validate(answer_result.structured_output)
+            answer_elapsed_ms = _elapsed_ms(answer_started)
+        except ValidationError as error:
             _log_processing_error(request_logger, stage, error)
             raise _friendly_error(
                 error,
                 diagnostic_id=diagnostic_id,
                 stage=stage,
             ) from error
-
-        if result_message is None:
-            missing_result = AnthropicServiceError(
-                f"Claude Agent SDK ended without a result. Diagnostic ID: {diagnostic_id}."
-            )
-            _log_processing_error(request_logger, stage, missing_result)
-            raise missing_result
-        if result_message.is_error or result_message.subtype != "success":
-            result_error = _agent_result_error(result_message, diagnostic_id)
-            _log_processing_error(request_logger, stage, result_error)
-            raise result_error
-
-        stage = "structured_output"
-        try:
-            draft = ModelAnswer.model_validate(result_message.structured_output)
-            repository = repository_tools.build_evidence_context()
-        except (ValidationError, ValueError) as error:
+        except AnthropicServiceError as error:
+            _log_processing_error(request_logger, stage, error)
+            raise
+        except RepositoryError as error:
+            _log_processing_error(request_logger, stage, error)
+            raise
+        except Exception as error:
             _log_processing_error(request_logger, stage, error)
             raise _friendly_error(
                 error,
@@ -219,9 +229,10 @@ class AnthropicRepositoryService:
             )
             _log_processing_error(request_logger, "repository_answer", empty_answer_error)
             raise empty_answer_error
-        usage = _agent_usage(result_message.usage)
+        usage = _combined_agent_usage(selection_result, answer_result)
         result = RepositoryAnswer(
             answer=answer_text,
+            spoken_answer=draft.spoken_answer.strip(),
             evidence=evidence,
             recommended_mode=draft.recommended_mode,
             mode_reason=bounded_text(
@@ -241,14 +252,74 @@ class AnthropicRepositoryService:
             output_tokens=usage.output_tokens,
             evidence_received=len(draft.evidence),
             evidence_accepted=len(evidence),
-            agent_elapsed_ms=_elapsed_ms(agent_started),
+            selection_elapsed_ms=selection_elapsed_ms,
+            content_read_elapsed_ms=content_read_elapsed_ms,
+            answer_elapsed_ms=answer_elapsed_ms,
             total_elapsed_ms=_elapsed_ms(total_started),
-            session_id=result_message.session_id,
-            turns=result_message.num_turns,
-            cost_usd=result_message.total_cost_usd,
+            selection_session_id=selection_result.session_id,
+            answer_session_id=answer_result.session_id,
+            selection_turns=selection_result.num_turns,
+            answer_turns=answer_result.num_turns,
+            cost_usd=(selection_result.total_cost_usd or 0) + (answer_result.total_cost_usd or 0),
             runtime="claude_agent_sdk",
         )
         return result
+
+    async def _run_structured_turn(
+        self,
+        *,
+        prompt: str,
+        system_prompt: str,
+        response_schema: dict[str, Any],
+        workspace_path: Path,
+        diagnostic_id: str,
+        stage: str,
+    ) -> ResultMessage:
+        if self._api_key is None:
+            raise AnthropicServiceError("Connect an Anthropic API key before asking Sentia.", 409)
+        options = ClaudeAgentOptions(
+            tools=[],
+            allowed_tools=[],
+            disallowed_tools=[
+                "Read",
+                "Glob",
+                "Grep",
+                "Edit",
+                "Write",
+                "Bash",
+                "NotebookEdit",
+                "WebFetch",
+                "WebSearch",
+                "Task",
+            ],
+            system_prompt=system_prompt,
+            mcp_servers={},
+            strict_mcp_config=True,
+            permission_mode="dontAsk",
+            cwd=workspace_path,
+            env={"ANTHROPIC_API_KEY": self._api_key},
+            max_turns=2,
+            model=self.model,
+            setting_sources=[],
+            output_format={"type": "json_schema", "schema": response_schema},
+        )
+        result_message: ResultMessage | None = None
+        try:
+            async for message in self._query(prompt=prompt, options=options):
+                if isinstance(message, ResultMessage):
+                    result_message = message
+        except Exception as error:
+            if result_message is not None and result_message.is_error:
+                raise _agent_result_error(result_message, diagnostic_id, stage) from error
+            raise
+        if result_message is None:
+            raise AnthropicServiceError(
+                "Claude Agent SDK ended without a result during "
+                f"{stage.replace('_', ' ')}. Diagnostic ID: {diagnostic_id}."
+            )
+        if result_message.is_error or result_message.subtype != "success":
+            raise _agent_result_error(result_message, diagnostic_id, stage)
+        return result_message
 
     async def render_speech(
         self,
@@ -414,18 +485,6 @@ class AnthropicRepositoryService:
             ) from error
 
 
-def _repository_agent_prompt(question: str, manifest: RepositoryManifest) -> str:
-    return (
-        f"QUESTION:\n{question.strip()}\n\n"
-        f"CACHED SNAPSHOT SUMMARY:\n{repository_snapshot_summary(manifest)}\n\n"
-        "Investigate this question autonomously. Search the cached snapshot, read only the "
-        "smallest useful set of files, then return the structured answer. Choose "
-        "recommendedMode=brainstorm for explanation, exploration, questions, or open-ended "
-        "ideation. Choose recommendedMode=build only when the user asks to plan, implement, fix, "
-        "add, remove, refactor, or test a concrete change."
-    )
-
-
 def _speech_text_delta(message: StreamEvent) -> str | None:
     event = message.event
     if event.get("type") != "content_block_delta":
@@ -440,6 +499,7 @@ def _speech_text_delta(message: StreamEvent) -> str | None:
 def _agent_result_error(
     message: ResultMessage,
     diagnostic_id: str,
+    stage: str,
 ) -> AnthropicServiceError:
     detail = next((error.strip() for error in message.errors or [] if error.strip()), None)
     logger.warning(
@@ -458,7 +518,8 @@ def _agent_result_error(
         status = 502
     suffix = f" {detail[:180]}" if detail else ""
     return AnthropicServiceError(
-        f"Claude Agent SDK could not complete the repository scan.{suffix} "
+        "Claude Agent SDK could not complete repository "
+        f"{stage.replace('_', ' ')}.{suffix} "
         f"Diagnostic ID: {diagnostic_id}.",
         status,
     )
@@ -471,6 +532,14 @@ def _agent_usage(usage: dict[str, Any] | None) -> TokenUsage:
     return TokenUsage(
         input_tokens=input_tokens if isinstance(input_tokens, int) else 0,
         output_tokens=output_tokens if isinstance(output_tokens, int) else 0,
+    )
+
+
+def _combined_agent_usage(*messages: ResultMessage) -> TokenUsage:
+    usages = [_agent_usage(message.usage) for message in messages]
+    return TokenUsage(
+        input_tokens=sum(usage.input_tokens for usage in usages),
+        output_tokens=sum(usage.output_tokens for usage in usages),
     )
 
 

@@ -318,6 +318,16 @@ This builds Sentia and opens a fresh VS Code Extension Development Host with the
 local extension loaded. The launcher reports a setup error if the Python
 sidecar or Visual Studio Code installation cannot be found.
 
+Development launches automatically open the **Sentia** output panel in the new
+VS Code window. It records local sidecar HTTP requests and responses, streamed
+speech-render events, OpenAI TTS request metadata, response status and headers,
+audio byte counts, and latency metrics. The shell that runs `npm start` does not
+receive extension-host logs because the VS Code CLI opens a detached window.
+Reopen the panel at any time with **Sentia: Open Diagnostics**. To include the
+actual spoken chunks in these local logs, enable
+`sentia.development.logVoicePayloads`; it is disabled by default to avoid
+recording repository content.
+
 ## Anthropic setup for live answers
 
 You need an Anthropic Console API key with active API billing or credits. A
@@ -388,11 +398,11 @@ to submit immediately.
 
 Sentia now has read-only-by-default adapters for both the Claude Agent SDK and
 OpenAI Codex SDK. Repository Q&A is provider-neutral: the selected provider
-investigates Sentia's cached manifest and returns the same grounded evidence
-contract. Claude uses a single Agent SDK loop with snapshot-backed search and
-sanitized read tools; Codex performs cached-manifest shortlisting and grounded
-synthesis around the shared local content reader. The SDK adapters also provide
-the tool-using coding layer used after planning and approval.
+selects files from Sentia's cached manifest and returns the same grounded
+evidence contract. Claude and Codex both perform a bounded manifest-shortlisting
+turn, use Sentia's sanitized local content reader, and then run a separate
+grounded synthesis turn. The SDK adapters also provide the tool-using coding
+layer used after planning and approval.
 
 On first launch, Sentia asks the user to choose **Claude Code** or **Codex** and
 remembers the choice in VS Code global state. Claude uses the masked Anthropic

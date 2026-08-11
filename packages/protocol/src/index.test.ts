@@ -127,6 +127,7 @@ describe("Sentia protocol", () => {
       requestId: "req_evidence",
       payload: {
         answer: "The provider is implemented here.",
+        spokenAnswer: "The provider is implemented in this module.",
         evidence: [
           {
             path: "backend/apps/ai/providers/anthropic_client.py",

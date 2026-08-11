@@ -324,6 +324,7 @@ class CodexRepositoryService:
         usage = _combined_usage(selection_result, answer_result)
         result = RepositoryAnswer(
             answer=answer_text,
+            spoken_answer=draft.spoken_answer.strip(),
             evidence=evidence,
             recommended_mode=draft.recommended_mode,
             mode_reason=bounded_text(

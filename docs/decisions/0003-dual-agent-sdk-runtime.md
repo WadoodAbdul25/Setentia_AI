@@ -58,8 +58,9 @@ non-read-only commands must pass through the future permission broker.
 ## Consequences
 
 - Provider selection can change without changing the UI state machine.
-- The sidecar retains evidence-validated Q&A while allowing Claude to recover
-  from weak one-shot file selection through a bounded agentic search loop.
+- The sidecar retains evidence-validated Q&A while bounding both providers to a
+  manifest-selection stage followed by deterministic evidence retrieval and a
+  separate answer stage.
 - Event mapping, cancellation, permission brokerage, and provider conformance
   tests become first-class product code.
 - Supporting two beta SDKs increases compatibility testing and package size.

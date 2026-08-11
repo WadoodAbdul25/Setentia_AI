@@ -70,4 +70,6 @@ if (launch.status !== 0) {
   process.exit(launch.status ?? 1);
 }
 
-console.log("Sentia launched. Use the Sentia icon in the new VS Code window.");
+console.log(
+  "Sentia launched. Use the Sentia icon in the new VS Code window; development logs open in its Sentia output panel.",
+);

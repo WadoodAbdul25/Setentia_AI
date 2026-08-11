@@ -37,6 +37,7 @@ async def test_codex_service_reuses_one_client_for_bounded_structured_turns(
     answer = json.dumps(
         {
             "answer": "The application starts in main.py.",
+            "spokenAnswer": "The application starts in the main module.",
             "evidence": [
                 {
                     "path": "main.py",
@@ -114,6 +115,7 @@ async def test_codex_service_reuses_one_client_for_bounded_structured_turns(
     assert "def start_app" in run_calls[1]["prompt"]
     assert "The application starts in main.py." in run_calls[2]["prompt"]
     assert first.model == "codex-test"
+    assert first.spoken_answer == "The application starts in the main module."
     assert first.selected_files == ["main.py"]
     assert first.evidence[0].path == "main.py"
     assert spoken.spoken_answer == "The application starts in the main module."

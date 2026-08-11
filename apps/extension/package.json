@@ -86,6 +86,18 @@
           "scope": "machine",
           "description": "Development-only path to a Sentia sidecar executable. Leave empty in packaged builds."
         },
+        "sentia.development.showLogsOnStartup": {
+          "type": "boolean",
+          "default": true,
+          "scope": "machine",
+          "description": "Automatically show the Sentia output channel when running the extension in development mode, including npm start launches."
+        },
+        "sentia.development.logVoicePayloads": {
+          "type": "boolean",
+          "default": false,
+          "scope": "machine",
+          "description": "Include spoken text chunks in development voice diagnostics. Leave disabled when repository answers may contain sensitive information."
+        },
         "sentia.voice.deepgramModel": {
           "type": "string",
           "enum": [

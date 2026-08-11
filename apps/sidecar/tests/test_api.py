@@ -170,6 +170,7 @@ class FakeAnthropicService(AnthropicRepositoryService):
         assert question == "What is this codebase?"
         return RepositoryAnswer(
             answer="This fixture documents a small project.",
+            spoken_answer="This fixture documents a small project.",
             evidence=[
                 EvidenceRange(path="README.md", start_line=1, end_line=2, label="Project README")
             ],
@@ -202,6 +203,7 @@ class FakeCodexRepositoryService:
         self.questions.append(question)
         return RepositoryAnswer(
             answer="Codex inspected the fixture.",
+            spoken_answer="Codex inspected the fixture in spoken form.",
             evidence=[],
             recommended_mode=WorkingMode.BRAINSTORM,
             mode_reason="The user asked for an explanation.",
@@ -275,6 +277,7 @@ def test_repository_question_routes_to_selected_codex_provider(
     assert answer.status_code == 200
     assert answer.json()["model"] == "codex-test"
     assert answer.json()["answer"] == "Codex inspected the fixture."
+    assert answer.json()["spokenAnswer"] == "Codex inspected the fixture in spoken form."
     assert codex.questions == ["Explain this with Codex."]
 
 

@@ -5,6 +5,9 @@ import { SidecarRuntime } from "./sidecarRuntime.js";
 
 export function activate(context: vscode.ExtensionContext): void {
   const output = vscode.window.createOutputChannel("Sentia", { log: true });
+  output.appendLine(
+    `[extension] Sentia activated mode=${vscode.ExtensionMode[context.extensionMode] ?? String(context.extensionMode)}`,
+  );
   const providerRef: { current?: SentiaViewProvider } = {};
   const runtime = new SidecarRuntime(context, output, {
     onEvent: (event) => providerRef.current?.postEvent(event),
@@ -54,6 +57,12 @@ export function activate(context: vscode.ExtensionContext): void {
       void vscode.commands.executeCommand<void>(
         "workbench.view.extension.sentia",
       );
+      const showLogs = vscode.workspace
+        .getConfiguration("sentia.development")
+        .get<boolean>("showLogsOnStartup", true);
+      if (showLogs) {
+        output.show(true);
+      }
     }, 250);
   }
 }

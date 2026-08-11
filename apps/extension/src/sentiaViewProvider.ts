@@ -531,43 +531,41 @@ export class SentiaViewProvider implements vscode.WebviewViewProvider {
                     },
                     onSpeechError,
                   );
-                  for await (const delta of this.runtime.renderSpeechStream(
-                    folder.uri.fsPath,
-                    answer.answer,
-                    provider,
-                  )) {
-                    this.deepgramSpeech.appendText(delta);
-                  }
+                  this.deepgramSpeech.appendText(answer.spokenAnswer);
                   this.deepgramSpeech.flushTurn();
                 } catch (error) {
                   this.deepgramSpeech.abortTurn();
                   throw error;
                 }
               } else {
-                const spoken = await this.runtime.renderSpeech(
-                  folder.uri.fsPath,
-                  answer.answer,
-                  provider,
-                );
-                void this.openaiSpeech.speak(
-                  {
-                    apiKey,
-                    endpoint: voiceConfiguration.get<string>(
-                      "openaiEndpoint",
-                      "https://api.openai.com",
-                    ),
-                    model: voiceConfiguration.get<string>(
-                      "openaiTtsModel",
-                      "gpt-4o-mini-tts",
-                    ),
-                    voice: voiceConfiguration.get<string>(
-                      "openaiVoice",
-                      "marin",
-                    ),
-                    text: spoken.spokenAnswer,
-                  },
-                  onSpeechError,
-                );
+                try {
+                  this.openaiSpeech.beginTurn(
+                    {
+                      apiKey,
+                      endpoint: voiceConfiguration.get<string>(
+                        "openaiEndpoint",
+                        "https://api.openai.com",
+                      ),
+                      model: voiceConfiguration.get<string>(
+                        "openaiTtsModel",
+                        "gpt-4o-mini-tts",
+                      ),
+                      voice: voiceConfiguration.get<string>(
+                        "openaiVoice",
+                        "marin",
+                      ),
+                      logPayloads: vscode.workspace
+                        .getConfiguration("sentia.development")
+                        .get<boolean>("logVoicePayloads", false),
+                    },
+                    onSpeechError,
+                  );
+                  this.openaiSpeech.appendText(answer.spokenAnswer);
+                  void this.openaiSpeech.flushTurn();
+                } catch (error) {
+                  this.openaiSpeech.abortTurn();
+                  throw error;
+                }
               }
             } catch (error) {
               void vscode.window.showWarningMessage(

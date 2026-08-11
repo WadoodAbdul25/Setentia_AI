@@ -207,6 +207,7 @@ export type TokenUsage = z.infer<typeof tokenUsageSchema>;
 
 export const repositoryAnswerSchema = z.object({
   answer: z.string().min(1),
+  spokenAnswer: z.string().min(1).max(3_000),
   evidence: z.array(evidenceRangeSchema),
   recommendedMode: workingModeSchema,
   modeReason: z.string().min(1).max(240),

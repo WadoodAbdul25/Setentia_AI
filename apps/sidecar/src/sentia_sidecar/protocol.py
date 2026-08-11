@@ -171,6 +171,7 @@ class TokenUsage(CamelModel):
 
 class RepositoryAnswer(CamelModel):
     answer: str
+    spoken_answer: str = Field(min_length=1, max_length=3_000)
     evidence: list[EvidenceRange] = Field(default_factory=list)
     recommended_mode: WorkingMode
     mode_reason: str = Field(min_length=1, max_length=240)

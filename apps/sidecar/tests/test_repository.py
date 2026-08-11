@@ -146,3 +146,21 @@ def test_targeted_shortlist_does_not_force_readme(tmp_path: Path) -> None:
     assert selection == [("src/auth_service.py", "full")]
     assert "CACHED PROJECT TREE" in manifest.prompt
     assert "src/auth_service.py" in manifest.prompt
+
+
+def test_question_terms_expand_shortlist_with_exact_layout_file(tmp_path: Path) -> None:
+    (tmp_path / "app").mkdir()
+    (tmp_path / "README.md").write_text("# Product\n", encoding="utf-8")
+    (tmp_path / "app" / "layout.ts").write_text(
+        "export const layoutColor = '#ffffff';\n",
+        encoding="utf-8",
+    )
+    manifest = build_repository_manifest(str(tmp_path))
+
+    selection = expand_repository_selection(
+        manifest,
+        [("README.md", "full")],
+        "I wanted to change the layout. What file do I need to work on?",
+    )
+
+    assert ("app/layout.ts", "full") in selection
