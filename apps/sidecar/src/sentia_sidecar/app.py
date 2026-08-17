@@ -43,14 +43,19 @@ from sentia_sidecar.protocol import (
     OpenAIVoiceCredentialStatus,
     ProjectSnapshotStatus,
     RepositoryAnswer,
+    RepositoryGraphRequest,
+    RepositoryGraphResponse,
     RepositoryQuestion,
+    RepositorySearchQuery,
+    RepositorySearchResponse,
     SpeechRenderRequest,
     SpeechRenderResponse,
     VersionResponse,
     WorkflowState,
     WorkspaceAttach,
 )
-from sentia_sidecar.repository import RepositoryError, build_repository_manifest
+from sentia_sidecar.repository import RepositoryError, RepositoryManifest, build_repository_manifest
+from sentia_sidecar.repository_index import RepositoryIndex
 from sentia_sidecar.repository_intelligence import (
     RepositoryIntelligenceError,
     RepositoryIntelligenceRouter,
@@ -116,7 +121,28 @@ def create_app(
     deepgram_api_key: str | None = None
     openai_voice_api_key: str | None = None
 
+    async def index_manifest(
+        repository: RepositoryManifest, triggers: list[str] | None = None
+    ) -> None:
+        stats = await asyncio.to_thread(
+            RepositoryIndex(repository.root).update,
+            repository,
+            triggers,
+        )
+        await events.publish(
+            "repository.index_updated",
+            {
+                "revision": stats.revision,
+                "filesIndexed": stats.files_indexed,
+                "filesRemoved": stats.files_removed,
+                "triggers": triggers or [],
+            },
+        )
+
     async def snapshot_updated(status: ProjectSnapshotStatus, triggers: list[str]) -> None:
+        repository = await snapshots.attached_manifest()
+        if repository is not None:
+            await index_manifest(repository, triggers)
         await events.publish(
             "repository.snapshot_updated",
             {
@@ -331,6 +357,9 @@ def create_app(
             raise HTTPException(status_code=400, detail=str(error)) from error
         except SnapshotError as error:
             raise HTTPException(status_code=500, detail=str(error)) from error
+        repository = await snapshots.manifest(body.workspace_path)
+        if repository is not None:
+            await index_manifest(repository)
         await events.publish(
             "repository.snapshot_attached",
             {
@@ -343,6 +372,72 @@ def create_app(
             },
         )
         return snapshot
+
+    @app.post(
+        "/api/v1/repository/search",
+        response_model=RepositorySearchResponse,
+        dependencies=auth_dependencies,
+    )
+    async def search_repository(body: RepositorySearchQuery) -> RepositorySearchResponse:
+        hits = await asyncio.to_thread(
+            RepositoryIndex(body.workspace_path).search, body.query, limit=body.limit
+        )
+        return RepositorySearchResponse(
+            hits=[
+                {
+                    "path": hit.path,
+                    "startLine": hit.start_line,
+                    "endLine": hit.end_line,
+                    "text": hit.text,
+                    "score": hit.score,
+                }
+                for hit in hits
+            ]
+        )
+
+    @app.post(
+        "/api/v1/repository/graph",
+        response_model=RepositoryGraphResponse,
+        dependencies=auth_dependencies,
+    )
+    async def repository_graph(body: RepositoryGraphRequest) -> RepositoryGraphResponse:
+        graph = await asyncio.to_thread(
+            RepositoryIndex(body.workspace_path).graph, path=body.path, depth=body.depth
+        )
+        return RepositoryGraphResponse(
+            nodes=[
+                {"id": node.id, "label": node.label, "kind": node.kind, "path": node.path}
+                | {
+                    "summary": node.summary,
+                    "functions": [
+                        {
+                            "name": function.name,
+                            "startLine": function.start_line,
+                            "endLine": function.end_line,
+                        }
+                        for function in node.functions
+                    ],
+                    "functionRanges": [
+                        {
+                            "name": function.name,
+                            "startLine": function.start_line,
+                            "endLine": function.end_line,
+                        }
+                        for function in node.function_ranges
+                    ],
+                }
+                for node in graph.nodes
+            ],
+            edges=[
+                {
+                    "source": edge.source,
+                    "target": edge.target,
+                    "edgeType": edge.edge_type,
+                    "resolution": edge.resolution,
+                }
+                for edge in graph.edges
+            ],
+        )
 
     @app.post(
         "/api/v1/repository/questions",
@@ -446,8 +541,7 @@ def create_app(
                     error_type=type(error).__name__,
                 )
                 yield (
-                    b'{"type":"error","message":'
-                    b'"Sentia could not prepare the spoken response."}\n'
+                    b'{"type":"error","message":"Sentia could not prepare the spoken response."}\n'
                 )
 
         return StreamingResponse(

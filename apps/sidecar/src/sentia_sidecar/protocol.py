@@ -140,6 +140,58 @@ class RepositoryQuestion(CamelModel):
     provider: AgentProvider = AgentProvider.CLAUDE
 
 
+class RepositorySearchQuery(CamelModel):
+    workspace_path: str = Field(min_length=1)
+    query: str = Field(min_length=1, max_length=500)
+    limit: int = Field(default=8, ge=1, le=30)
+
+
+class RepositorySearchHit(CamelModel):
+    path: str
+    start_line: int = Field(ge=1)
+    end_line: int = Field(ge=1)
+    text: str
+    score: float
+
+
+class RepositorySearchResponse(CamelModel):
+    hits: list[RepositorySearchHit] = Field(default_factory=list)
+
+
+class RepositoryGraphRequest(CamelModel):
+    workspace_path: str = Field(min_length=1)
+    path: str | None = None
+    depth: int = Field(default=1, ge=0, le=3)
+
+
+class RepositoryGraphNode(CamelModel):
+    id: str
+    label: str
+    kind: str
+    path: str
+    summary: str
+    functions: list["RepositoryGraphFunction"] = Field(default_factory=list)
+    function_ranges: list["RepositoryGraphFunction"] = Field(default_factory=list)
+
+
+class RepositoryGraphFunction(CamelModel):
+    name: str
+    start_line: int = Field(ge=1)
+    end_line: int = Field(ge=1)
+
+
+class RepositoryGraphEdge(CamelModel):
+    source: str
+    target: str
+    edge_type: str
+    resolution: str
+
+
+class RepositoryGraphResponse(CamelModel):
+    nodes: list[RepositoryGraphNode] = Field(default_factory=list)
+    edges: list[RepositoryGraphEdge] = Field(default_factory=list)
+
+
 class SpeechRenderRequest(CamelModel):
     workspace_path: str = Field(min_length=1)
     answer: str = Field(min_length=1, max_length=30_000)

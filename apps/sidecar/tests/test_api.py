@@ -57,6 +57,43 @@ def test_health_reports_protocol(client: TestClient, auth_headers: dict[str, str
     assert response.json()["workflowState"] == "ready"
 
 
+def test_snapshot_creates_local_searchable_graph_index(
+    client: TestClient, auth_headers: dict[str, str], tmp_path: Path
+) -> None:
+    (tmp_path / "service.py").write_text(
+        """def helper() -> str:
+    return \"repository signal\"
+
+def run() -> str:
+    return helper()
+""",
+        encoding="utf-8",
+    )
+    attached = client.put(
+        "/api/v1/repository/snapshot",
+        headers=auth_headers,
+        json={"workspacePath": str(tmp_path)},
+    )
+    searched = client.post(
+        "/api/v1/repository/search",
+        headers=auth_headers,
+        json={"workspacePath": str(tmp_path), "query": "signal"},
+    )
+    graphed = client.post(
+        "/api/v1/repository/graph",
+        headers=auth_headers,
+        json={"workspacePath": str(tmp_path), "path": "service.py"},
+    )
+
+    assert attached.status_code == 200
+    assert searched.json()["hits"][0]["path"] == "service.py"
+    assert [node["label"] for node in graphed.json()["nodes"]] == ["service.py"]
+    assert [item["name"] for item in graphed.json()["nodes"][0]["functions"]] == [
+        "helper",
+        "run",
+    ]
+
+
 def test_openai_voice_credentials_stay_in_sidecar_memory(
     client: TestClient, auth_headers: dict[str, str]
 ) -> None:

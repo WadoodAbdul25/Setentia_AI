@@ -10,6 +10,7 @@ import type { EditorBridge } from "@sentia/editor-client";
 import type {
   AgentProvider,
   EvidenceRange,
+  RepositoryGraph,
   VoiceProvider,
 } from "@sentia/protocol";
 import clsx from "clsx";
@@ -35,6 +36,82 @@ interface PendingVoiceSubmission {
   turnKey: string;
 }
 
+function isStructuralQuery(value: string): boolean {
+  return /\b(what calls|who calls|callers?|imports?|dependenc(?:y|ies)|depends on)\b/i.test(
+    value,
+  );
+}
+
+function InteractiveGraph({
+  graph,
+  onOpen,
+}: {
+  graph: RepositoryGraph;
+  onOpen: (node: RepositoryGraph["nodes"][number]) => void;
+}) {
+  const positions = graph.nodes.map((node, index) => {
+    const angle =
+      (Math.PI * 2 * index) / Math.max(graph.nodes.length, 1) - Math.PI / 2;
+    const radius = graph.nodes.length > 5 ? 37 : 27;
+    return {
+      id: node.id,
+      x: 50 + Math.cos(angle) * radius,
+      y: 50 + Math.sin(angle) * radius,
+    };
+  });
+  const byId = new Map(positions.map((position) => [position.id, position]));
+  return (
+    <div
+      className="interactive-graph"
+      aria-label="Interactive repository graph"
+    >
+      <svg
+        aria-hidden="true"
+        className="interactive-graph__edges"
+        viewBox="0 0 100 100"
+      >
+        {graph.edges.map((edge, index) => {
+          const source = byId.get(edge.source);
+          const target = byId.get(edge.target);
+          return source && target ? (
+            <line
+              className={
+                edge.resolution === "exact" ? "is-exact" : "is-best-effort"
+              }
+              key={`${edge.source}-${edge.target}-${index}`}
+              x1={source.x}
+              x2={target.x}
+              y1={source.y}
+              y2={target.y}
+            />
+          ) : null;
+        })}
+      </svg>
+      {graph.nodes.map((node) => {
+        const position = byId.get(node.id);
+        return position ? (
+          <button
+            className="graph-bubble"
+            key={node.id}
+            onClick={() => onOpen(node)}
+            style={{ left: `${position.x}%`, top: `${position.y}%` }}
+            type="button"
+          >
+            <strong>{node.label}</strong>
+            <span className="graph-bubble__detail">
+              {node.summary}
+              <em>
+                {node.functions.map((item) => item.name).join(" · ") ||
+                  "No functions indexed"}
+              </em>
+            </span>
+          </button>
+        ) : null;
+      })}
+    </div>
+  );
+}
+
 export function App({ bridge }: AppProps) {
   const [modePreference, setModePreference] = useState<ModePreference>("auto");
   const [question, setQuestion] = useState("What is this codebase about?");
@@ -51,6 +128,7 @@ export function App({ bridge }: AppProps) {
     events,
     extensionVersion,
     repositoryAnswer,
+    repositoryGraph,
     requestError,
     sidecar,
     workspaceName,
@@ -147,6 +225,12 @@ export function App({ bridge }: AppProps) {
         question: normalized,
         responseMode,
       });
+      if (isStructuralQuery(normalized)) {
+        bridge.post({
+          type: "repository.graph",
+          requestId: crypto.randomUUID(),
+        });
+      }
       return requestId;
     },
     [bridge],
@@ -158,6 +242,22 @@ export function App({ bridge }: AppProps) {
       return;
     }
     submitQuestion(question);
+  }
+
+  function loadGraph(): void {
+    bridge.post({ type: "repository.graph", requestId: crypto.randomUUID() });
+  }
+
+  function openGraphFile(node: RepositoryGraph["nodes"][number]): void {
+    bridge.post({
+      type: "editor.open_file_functions",
+      requestId: crypto.randomUUID(),
+      path: node.path,
+      functions: node.functionRanges.map((item) => ({
+        startLine: item.startLine,
+        endLine: item.endLine,
+      })),
+    });
   }
 
   const cancelVoiceCapture = useCallback((): void => {
@@ -472,6 +572,35 @@ export function App({ bridge }: AppProps) {
               {providerName} connected
             </span>
             <button onClick={changeAgent}>Change agent</button>
+          </section>
+
+          <section className="graph-card">
+            <div className="answer-card__heading">
+              <div>
+                <span className="eyebrow">Repository graph</span>
+                <h2>Module relationships</h2>
+              </div>
+              <button onClick={loadGraph} type="button">
+                {repositoryGraph ? "Refresh graph" : "Load graph"}
+              </button>
+            </div>
+            {repositoryGraph ? (
+              <>
+                <p>
+                  {repositoryGraph.nodes.length} symbols and{" "}
+                  {repositoryGraph.edges.length} static relationships. Dotted
+                  links are best-effort resolution.
+                </p>
+                <InteractiveGraph
+                  graph={repositoryGraph}
+                  onOpen={openGraphFile}
+                />
+              </>
+            ) : (
+              <p>
+                Load the local index to explore imports and best-effort calls.
+              </p>
+            )}
           </section>
 
           <form className="question-card" onSubmit={askRepository}>

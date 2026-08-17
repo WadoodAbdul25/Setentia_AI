@@ -4,6 +4,7 @@ import type {
   DeepgramStatus,
   EventEnvelope,
   RepositoryAnswer,
+  RepositoryGraph,
   SidecarStatus,
   OpenAIVoiceStatus,
   VoiceProvider,
@@ -24,6 +25,7 @@ interface SentiaState {
   workspaceName: string | null;
   workspaceTrusted: boolean;
   repositoryAnswer: { requestId: string; payload: RepositoryAnswer } | null;
+  repositoryGraph: RepositoryGraph | null;
   requestError: { requestId: string; error: string } | null;
   voiceStatus: {
     sessionId: string;
@@ -50,6 +52,7 @@ interface SentiaState {
   setOpenAIVoice(openaiVoice: OpenAIVoiceStatus): void;
   setVoiceProvider(voiceProvider: VoiceProvider): void;
   setRepositoryAnswer(requestId: string, payload: RepositoryAnswer): void;
+  setRepositoryGraph(graph: RepositoryGraph): void;
   setRequestError(requestId: string, error: string): void;
   setSidecar(sidecar: SidecarStatus): void;
   setVoiceStatus(
@@ -88,6 +91,7 @@ export const useSentiaStore = create<SentiaState>((set) => ({
   workspaceName: null,
   workspaceTrusted: false,
   repositoryAnswer: null,
+  repositoryGraph: null,
   requestError: null,
   voiceStatus: null,
   voiceTranscript: null,
@@ -102,6 +106,7 @@ export const useSentiaStore = create<SentiaState>((set) => ({
   setVoiceProvider: (voiceProvider) => set({ voiceProvider }),
   setRepositoryAnswer: (requestId, payload) =>
     set({ repositoryAnswer: { requestId, payload }, requestError: null }),
+  setRepositoryGraph: (repositoryGraph) => set({ repositoryGraph }),
   setRequestError: (requestId, error) =>
     set({ requestError: { requestId, error } }),
   setSidecar: (sidecar) => set({ sidecar }),

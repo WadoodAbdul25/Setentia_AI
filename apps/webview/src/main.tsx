@@ -35,6 +35,8 @@ bridge.subscribe((raw) => {
     useSentiaStore
       .getState()
       .setRepositoryAnswer(message.requestId, message.payload);
+  } else if (message.type === "repository.graph") {
+    useSentiaStore.getState().setRepositoryGraph(message.payload);
   } else if (message.type === "request.error") {
     useSentiaStore.getState().setRequestError(message.requestId, message.error);
   } else if (message.type === "voice.status") {

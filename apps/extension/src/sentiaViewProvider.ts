@@ -472,6 +472,16 @@ export class SentiaViewProvider implements vscode.WebviewViewProvider {
           await this.clearAgentProvider();
           this.respond(message.requestId, true);
           break;
+        case "repository.graph": {
+          const folder = this.requireTrustedWorkspace();
+          const graph = await this.runtime.repositoryGraph(folder.uri.fsPath);
+          this.post({
+            type: "repository.graph",
+            requestId: message.requestId,
+            payload: graph,
+          });
+          break;
+        }
         case "repository.ask": {
           const folder = this.requireTrustedWorkspace();
           const provider = this.agent.selectedProvider;
@@ -676,6 +686,10 @@ export class SentiaViewProvider implements vscode.WebviewViewProvider {
           break;
         case "editor.open_evidence":
           await this.openEvidence(message.evidence);
+          this.respond(message.requestId, true);
+          break;
+        case "editor.open_file_functions":
+          await this.openFileFunctions(message.path, message.functions);
           this.respond(message.requestId, true);
           break;
       }
@@ -908,6 +922,33 @@ export class SentiaViewProvider implements vscode.WebviewViewProvider {
       vscode.TextEditorRevealType.InCenterIfOutsideViewport,
     );
     editor.setDecorations(this.evidenceDecoration, [range]);
+    setTimeout(() => editor.setDecorations(this.evidenceDecoration, []), 4_000);
+  }
+
+  private async openFileFunctions(
+    filePath: string,
+    functions: Array<{ startLine: number; endLine: number }>,
+  ): Promise<void> {
+    await this.openEvidence({
+      path: filePath,
+      startLine: functions[0]?.startLine ?? 1,
+      endLine: functions[0]?.endLine ?? 1,
+    });
+    const editor = vscode.window.activeTextEditor;
+    if (!editor || functions.length === 0) {
+      return;
+    }
+    const ranges = functions.map((item) => {
+      const start = Math.max(0, item.startLine - 1);
+      const end = Math.min(editor.document.lineCount - 1, item.endLine - 1);
+      return new vscode.Range(
+        start,
+        0,
+        end,
+        editor.document.lineAt(end).text.length,
+      );
+    });
+    editor.setDecorations(this.evidenceDecoration, ranges);
     setTimeout(() => editor.setDecorations(this.evidenceDecoration, []), 4_000);
   }
 

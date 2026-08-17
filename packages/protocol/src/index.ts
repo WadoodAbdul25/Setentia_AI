@@ -220,6 +220,39 @@ export const repositoryAnswerSchema = z.object({
 
 export type RepositoryAnswer = z.infer<typeof repositoryAnswerSchema>;
 
+export const repositoryGraphNodeSchema = z.object({
+  id: z.string().min(1),
+  label: z.string().min(1),
+  kind: z.string().min(1),
+  path: z.string().min(1),
+  summary: z.string().min(1),
+  functions: z.array(
+    z.object({
+      name: z.string().min(1),
+      startLine: z.number().int().positive(),
+      endLine: z.number().int().positive(),
+    }),
+  ),
+  functionRanges: z.array(
+    z.object({
+      name: z.string().min(1),
+      startLine: z.number().int().positive(),
+      endLine: z.number().int().positive(),
+    }),
+  ),
+});
+export const repositoryGraphEdgeSchema = z.object({
+  source: z.string().min(1),
+  target: z.string().min(1),
+  edgeType: z.enum(["import", "call"]),
+  resolution: z.enum(["exact", "best_effort", "unresolved"]),
+});
+export const repositoryGraphSchema = z.object({
+  nodes: z.array(repositoryGraphNodeSchema),
+  edges: z.array(repositoryGraphEdgeSchema),
+});
+export type RepositoryGraph = z.infer<typeof repositoryGraphSchema>;
+
 export const spokenAnswerSchema = z.object({
   spokenAnswer: z.string().min(1).max(3_000),
 });
@@ -250,6 +283,17 @@ export const webviewToExtensionMessageSchema = z.discriminatedUnion("type", [
   requestBase.extend({ type: z.literal("agent.connect") }),
   requestBase.extend({ type: z.literal("agent.refresh") }),
   requestBase.extend({ type: z.literal("agent.clear_selection") }),
+  requestBase.extend({ type: z.literal("repository.graph") }),
+  requestBase.extend({
+    type: z.literal("editor.open_file_functions"),
+    path: z.string().min(1),
+    functions: z.array(
+      z.object({
+        startLine: z.number().int().positive(),
+        endLine: z.number().int().positive(),
+      }),
+    ),
+  }),
   requestBase.extend({
     type: z.literal("repository.ask"),
     question: z.string().trim().min(1).max(2_000),
@@ -316,6 +360,11 @@ export const extensionToWebviewMessageSchema = z.discriminatedUnion("type", [
     type: z.literal("repository.answer"),
     requestId: z.string().min(1),
     payload: repositoryAnswerSchema,
+  }),
+  z.object({
+    type: z.literal("repository.graph"),
+    requestId: z.string().min(1),
+    payload: repositoryGraphSchema,
   }),
   z.object({
     type: z.literal("request.error"),

@@ -198,6 +198,11 @@ class ProjectSnapshotService:
                 return self._manifest
         return await asyncio.to_thread(load_snapshot_repository_manifest, str(root))
 
+    async def attached_manifest(self) -> RepositoryManifest | None:
+        """Return the current attached workspace manifest without exposing internal state."""
+        async with self._lock:
+            return self._manifest
+
     async def _stop_locked(self) -> None:
         task = self._task
         self._task = None

@@ -16,6 +16,7 @@ import {
   projectSnapshotStatusSchema,
   PROTOCOL_VERSION,
   repositoryAnswerSchema,
+  repositoryGraphSchema,
   spokenAnswerSchema,
   voiceServerMessageSchema,
   workflowStateSchema,
@@ -27,6 +28,7 @@ import {
   type EventEnvelope,
   type ProjectSnapshotStatus,
   type RepositoryAnswer,
+  type RepositoryGraph,
   type SpokenAnswer,
   type SidecarStatus,
   type OpenAIVoiceStatus,
@@ -386,6 +388,18 @@ export class SidecarRuntime implements vscode.Disposable {
         body: JSON.stringify({ workspacePath, question, provider }),
       },
       repositoryAnswerSchema,
+    );
+  }
+
+  async repositoryGraph(workspacePath: string): Promise<RepositoryGraph> {
+    return await this.request(
+      "/api/v1/repository/graph",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ workspacePath, depth: 1 }),
+      },
+      repositoryGraphSchema,
     );
   }
 
