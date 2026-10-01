@@ -11,6 +11,7 @@ import {
   anthropicStatusSchema,
   deepgramStatusSchema,
   eventEnvelopeSchema,
+  flowMapResponseSchema,
   healthResponseSchema,
   openaiVoiceStatusSchema,
   projectSnapshotStatusSchema,
@@ -25,6 +26,7 @@ import {
   type AnthropicStatus,
   type DeepgramStatus,
   type EventEnvelope,
+  type FlowMapResponse,
   type ProjectSnapshotStatus,
   type RepositoryAnswer,
   type SpokenAnswer,
@@ -110,11 +112,26 @@ export class SidecarRuntime implements vscode.Disposable {
     this.token = randomBytes(32).toString("base64url");
     const launch = this.resolveLaunchCommand();
     this.output.appendLine(`[sidecar] launching ${launch.command}`);
+    const codexExtension = vscode.extensions.getExtension("openai.chatgpt");
+    const codexPlatform = `${process.platform === "darwin" ? "macos" : process.platform}-${process.arch === "arm64" ? "aarch64" : process.arch === "x64" ? "x86_64" : process.arch}`;
+    const codexBinary = codexExtension
+      ? path.join(
+          codexExtension.extensionPath,
+          "bin",
+          codexPlatform,
+          process.platform === "win32" ? "codex.exe" : "codex",
+        )
+      : undefined;
 
     this.child = spawn(launch.command, launch.args, {
       cwd: launch.cwd,
       env: {
         ...process.env,
+        ...(codexBinary &&
+        existsSync(codexBinary) &&
+        !process.env.SENTIA_CODEX_BIN
+          ? { SENTIA_CODEX_BIN: codexBinary }
+          : {}),
         SENTIA_HOST: "127.0.0.1",
         SENTIA_PORT: String(this.port),
         SENTIA_TOKEN: this.token,
@@ -386,6 +403,27 @@ export class SidecarRuntime implements vscode.Disposable {
         body: JSON.stringify({ workspacePath, question, provider }),
       },
       repositoryAnswerSchema,
+    );
+  }
+
+  async createFlowMap(
+    workspacePath: string,
+    question: string,
+    provider: AgentProvider,
+  ): Promise<FlowMapResponse> {
+    return await this.request(
+      "/api/v1/repository/flow-maps",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          workspacePath,
+          question,
+          provider,
+          engineVersion: "2",
+        }),
+      },
+      flowMapResponseSchema,
     );
   }
 

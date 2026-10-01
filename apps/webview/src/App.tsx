@@ -22,7 +22,7 @@ import {
 import { MarkdownAnswer } from "./MarkdownAnswer";
 import { useSentiaStore } from "./store";
 import {
-  DEEPGRAM_AUTO_SUBMIT_DELAY_MS,
+  VOICE_AUTO_SUBMIT_DELAY_MS,
   resolveVoiceTurnAction,
 } from "./voiceSubmission";
 
@@ -50,6 +50,7 @@ export function App({ bridge }: AppProps) {
     deepgram,
     events,
     extensionVersion,
+    flowMapOpened,
     repositoryAnswer,
     requestError,
     sidecar,
@@ -72,7 +73,13 @@ export function App({ bridge }: AppProps) {
       : null;
   const error =
     requestError?.requestId === activeRequestId ? requestError.error : null;
-  const asking = activeRequestId !== null && answer === null && error === null;
+  const mapOpened =
+    flowMapOpened?.requestId === activeRequestId ? flowMapOpened : null;
+  const asking =
+    activeRequestId !== null &&
+    answer === null &&
+    error === null &&
+    mapOpened === null;
   const agentConnected = agent.connection?.connected === true;
   const providerName =
     agent.selectedProvider === "claude" ? "Claude Code" : "Codex";
@@ -271,7 +278,7 @@ export function App({ bridge }: AppProps) {
     }
     const timer = window.setTimeout(() => {
       submitVoiceTurn(pendingVoiceSubmission);
-    }, DEEPGRAM_AUTO_SUBMIT_DELAY_MS);
+    }, VOICE_AUTO_SUBMIT_DELAY_MS);
     return () => window.clearTimeout(timer);
   }, [pendingVoiceSubmission, submitVoiceTurn]);
 
@@ -296,6 +303,7 @@ export function App({ bridge }: AppProps) {
       evidence,
     });
   }
+
   return (
     <main className="app-shell">
       <header className="app-header">
@@ -566,7 +574,7 @@ export function App({ bridge }: AppProps) {
               id="sentia-question"
               maxLength={2000}
               onChange={(event) => setQuestion(event.target.value)}
-              placeholder="What is this codebase about?"
+              placeholder="Ask about the codebase, or say ‘Create a flow map for…’"
               rows={3}
               value={question}
             />
@@ -620,6 +628,16 @@ export function App({ bridge }: AppProps) {
               >
                 Open Sentia Diagnostics
               </button>
+            </section>
+          ) : null}
+
+          {mapOpened ? (
+            <section className="answer-card flow-map-opened" aria-live="polite">
+              <h2>Flow Map opened</h2>
+              <p>
+                Sentia is building “{mapOpened.question}” in a dedicated editor
+                tab.
+              </p>
             </section>
           ) : null}
 

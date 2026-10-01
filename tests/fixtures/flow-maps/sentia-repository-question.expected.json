@@ -1,0 +1,51 @@
+{
+  "schemaVersion": "1",
+  "question": "Show me what happens when I ask Sentia a repository question.",
+  "expectedRootCandidates": [
+    {
+      "path": "apps/webview/src/App.tsx",
+      "qualifiedName": "App.submitQuestion"
+    }
+  ],
+  "expectedProcesses": ["webview", "extension", "sidecar", "model_provider"],
+  "expectedBoundaries": [
+    {
+      "kind": "message_channel",
+      "key": "repository.ask"
+    },
+    {
+      "kind": "http_endpoint",
+      "method": "POST",
+      "path": "/api/v1/repository/questions"
+    },
+    {
+      "kind": "message_channel",
+      "key": "repository.answer"
+    }
+  ],
+  "expectedSymbolAnchors": [
+    {
+      "path": "apps/extension/src/sentiaViewProvider.ts",
+      "qualifiedName": "SentiaViewProvider.handleMessage"
+    },
+    {
+      "path": "apps/extension/src/sidecarRuntime.ts",
+      "qualifiedName": "SidecarRuntime.askRepository"
+    },
+    {
+      "path": "apps/sidecar/src/sentia_sidecar/app.py",
+      "qualifiedName": "create_app.ask_repository"
+    },
+    {
+      "path": "apps/sidecar/src/sentia_sidecar/repository_intelligence.py",
+      "qualifiedName": "RepositoryIntelligenceRouter.answer"
+    }
+  ],
+  "parallelChannels": [
+    {
+      "kind": "websocket_events",
+      "path": "/ws",
+      "carriesAnswerPayload": false
+    }
+  ]
+}

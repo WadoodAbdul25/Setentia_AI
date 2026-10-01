@@ -569,6 +569,10 @@ button {
   font-size: 9px;
 }
 
+.flow-map-opened {
+  border-color: var(--vscode-focusBorder);
+}
+
 .answer-copy {
   font-size: 12px;
   margin-top: 12px;

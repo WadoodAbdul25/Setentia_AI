@@ -17,15 +17,39 @@ from anthropic import (
     RateLimitError,
 )
 from claude_agent_sdk import (
+    AssistantMessage,
     ClaudeAgentOptions,
     ResultMessage,
     StreamEvent,
+    ToolResultBlock,
+    ToolUseBlock,
+    UserMessage,
     query,
 )
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 from structlog.typing import FilteringBoundLogger
 
-from sentia_sidecar.protocol import AgentProvider, RepositoryAnswer, TokenUsage
+from sentia_sidecar.feature_trace import (
+    TRACE_SYSTEM_PROMPT,
+    FeatureTraceEngine,
+    FeatureTraceResult,
+    TraceTurn,
+)
+from sentia_sidecar.flow_investigation import (
+    ROOT_SELECTION_SYSTEM_PROMPT,
+    FlowRootSelectionResult,
+    ModelFlowRootSelection,
+    build_investigation,
+    flow_root_prompt,
+    root_candidates,
+    validate_root_selection,
+)
+from sentia_sidecar.protocol import (
+    AgentProvider,
+    FlowInvestigationUsage,
+    RepositoryAnswer,
+    TokenUsage,
+)
 from sentia_sidecar.repository import (
     MAX_SELECTED_FILES,
     RepositoryError,
@@ -46,10 +70,16 @@ from sentia_sidecar.repository_intelligence import (
     speech_stream_prompt,
     validate_evidence,
 )
+from sentia_sidecar.structural_index import StructuralIndex
 
 logger = structlog.get_logger(__name__)
 
 CONTENT_RETRIEVAL_TIMEOUT_SECONDS = 15.0
+TRACE_SDK_MAX_TURNS = 4
+CLAUDE_TRACE_OUTPUT_INSTRUCTIONS = """Submit the decision using the StructuredOutput tool.
+If the tool reports a schema error, correct every reported violation and submit again.
+Do not duplicate the decision in prose. Missing anchors belong in missingConcepts and
+searchQueries, never in a stage with empty entityIds."""
 
 QueryFunction = Callable[..., AsyncIterator[Any]]
 
@@ -265,6 +295,170 @@ class AnthropicRepositoryService:
         )
         return result
 
+    async def trace_feature(
+        self, question: str, manifest: RepositoryManifest, index: StructuralIndex
+    ) -> FeatureTraceResult:
+        if self._api_key is None:
+            raise AnthropicServiceError("Connect an Anthropic API key before asking Sentia.", 409)
+        diagnostic_id = f"sentia_{uuid4().hex[:12]}"
+
+        async def run_model(prompt: str, schema: type[BaseModel], stage: str) -> TraceTurn:
+            started = time.perf_counter()
+            result = await self._run_structured_turn(
+                prompt=prompt,
+                system_prompt=TRACE_SYSTEM_PROMPT,
+                response_schema=schema.model_json_schema(by_alias=True),
+                workspace_path=manifest.root,
+                diagnostic_id=diagnostic_id,
+                stage=f"feature_trace_{stage}",
+            )
+            usage = _agent_usage(result.usage)
+            logger.info(
+                "feature_trace_model_turn",
+                provider=self.provider,
+                stage=stage,
+                input_tokens=usage.input_tokens,
+                output_tokens=usage.output_tokens,
+                elapsed_ms=_elapsed_ms(started),
+            )
+            return TraceTurn(output=result.structured_output, usage=usage)
+
+        try:
+            return await FeatureTraceEngine().investigate(
+                question,
+                manifest,
+                index,
+                provider=self.provider,
+                model=self.model,
+                run_model=run_model,
+            )
+        except (RepositoryError, AnthropicServiceError):
+            raise
+        except Exception as error:
+            raise _friendly_error(
+                error, diagnostic_id=diagnostic_id, stage="feature_trace_planning"
+            ) from error
+
+    async def select_flow_roots(
+        self,
+        question: str,
+        manifest: RepositoryManifest,
+        index: StructuralIndex,
+    ) -> FlowRootSelectionResult:
+        if self._api_key is None:
+            raise AnthropicServiceError("Connect an Anthropic API key before asking Sentia.", 409)
+        if index.repository_revision != manifest.repository_revision:
+            raise AnthropicServiceError(
+                "The repository manifest and structural index revisions do not match.",
+                409,
+            )
+        if not index.entities:
+            raise AnthropicServiceError(
+                "Sentia has no indexed code entities to use as Flow Map roots.",
+                422,
+            )
+
+        diagnostic_id = f"sentia_{uuid4().hex[:12]}"
+        stage = "flow_file_selection"
+        try:
+            selection_result = await self._run_structured_turn(
+                prompt=(
+                    f"QUESTION:\n{question.strip()}\n\n"
+                    f"{manifest.prompt}\n\n"
+                    f"Select no more than {MAX_SELECTED_FILES} files. Return a short "
+                    "selection report with a read mode and reason for each file."
+                ),
+                system_prompt=SELECTION_SYSTEM_PROMPT,
+                response_schema=FileSelection.model_json_schema(by_alias=True),
+                workspace_path=manifest.root,
+                diagnostic_id=diagnostic_id,
+                stage=stage,
+            )
+            file_selection = FileSelection.model_validate(selection_result.structured_output)
+            requested = expand_repository_selection(
+                manifest,
+                [(choice.path, choice.read_mode) for choice in file_selection.files],
+                question,
+            )
+            stage = "flow_content_read"
+            try:
+                async with asyncio.timeout(CONTENT_RETRIEVAL_TIMEOUT_SECONDS):
+                    repository = await asyncio.to_thread(
+                        build_selected_repository_context,
+                        manifest,
+                        requested,
+                    )
+            except TimeoutError as error:
+                raise AnthropicServiceError(
+                    "Sentia's content reader exceeded 15 seconds. Try a narrower question.",
+                    504,
+                ) from error
+
+            candidates = root_candidates(index, repository, question)
+            selection_report = "\n".join(
+                [file_selection.rationale]
+                + [
+                    f"- {choice.path} ({choice.read_mode}): {choice.reason}"
+                    for choice in file_selection.files
+                    if choice.path in manifest.files
+                ]
+            )
+            stage = "flow_root_selection"
+            root_schema = ModelFlowRootSelection.model_json_schema(by_alias=True)
+            root_schema["properties"]["rootEntityIds"]["items"]["enum"] = [
+                entity.entity_id for entity in candidates
+            ]
+            root_result = await self._run_structured_turn(
+                prompt=flow_root_prompt(
+                    question,
+                    repository,
+                    candidates,
+                    selection_report=selection_report,
+                ),
+                system_prompt=ROOT_SELECTION_SYSTEM_PROMPT,
+                response_schema=root_schema,
+                workspace_path=manifest.root,
+                diagnostic_id=diagnostic_id,
+                stage=stage,
+            )
+            draft = ModelFlowRootSelection.model_validate(root_result.structured_output)
+            root_selection = validate_root_selection(draft, index, candidates)
+            stage = "flow_investigation"
+            investigation = build_investigation(
+                question=question,
+                provider=self.provider,
+                manifest=manifest,
+                repository=repository,
+                selection=root_selection,
+            )
+        except AnthropicServiceError:
+            raise
+        except RepositoryError:
+            raise
+        except Exception as error:
+            raise _friendly_error(
+                error,
+                diagnostic_id=diagnostic_id,
+                stage=stage,
+            ) from error
+
+        file_selection_usage = _agent_usage(selection_result.usage)
+        initial_anchor_usage = _agent_usage(root_result.usage)
+        coverage_usage = TokenUsage(input_tokens=0, output_tokens=0)
+        total_usage = _combined_agent_usage(selection_result, root_result)
+        return FlowRootSelectionResult(
+            investigation=investigation,
+            selection=root_selection,
+            model=self.model,
+            usage=total_usage,
+            investigation_usage=FlowInvestigationUsage(
+                file_selection=file_selection_usage,
+                initial_anchor_selection=initial_anchor_usage,
+                coverage_pass=coverage_usage,
+                total=total_usage,
+            ),
+        )
+
     async def _run_structured_turn(
         self,
         *,
@@ -303,11 +497,86 @@ class AnthropicRepositoryService:
             setting_sources=[],
             output_format={"type": "json_schema", "schema": response_schema},
         )
+        is_trace = stage.startswith("feature_trace_")
+        if is_trace:
+            # One engine decision can require several SDK tool/validation round trips.
+            # Allow the initial submission plus repairs within the same cost/time budget.
+            options.max_turns = TRACE_SDK_MAX_TURNS
+            options.system_prompt = f"{system_prompt}\n\n{CLAUDE_TRACE_OUTPUT_INSTRUCTIONS}"
+            options.effort = "low"
+            options.max_budget_usd = 0.50
+            options.env["CLAUDE_CODE_MAX_OUTPUT_TOKENS"] = "4096"
+            logger.info(
+                "feature_trace_request_started",
+                diagnostic_id=diagnostic_id,
+                stage=stage,
+                model=self.model,
+                prompt_characters=len(prompt),
+                system_characters=len(system_prompt),
+                max_turns=options.max_turns,
+                max_budget_usd=options.max_budget_usd,
+                max_output_tokens=4096,
+                effort=options.effort,
+            )
         result_message: ResultMessage | None = None
+        usage_snapshots: dict[str, dict[str, int]] = {}
+        structured_tool_ids: set[str] = set()
+        rejected_tool_ids: set[str] = set()
         try:
             async for message in self._query(prompt=prompt, options=options):
+                if is_trace and isinstance(message, AssistantMessage):
+                    structured_tool_ids.update(
+                        block.id
+                        for block in message.content
+                        if isinstance(block, ToolUseBlock) and block.name == "StructuredOutput"
+                    )
+                    # The CLI emits separate content blocks with the same message ID
+                    # and provisional usage. Suppress repeats, but retain revised usage.
+                    values = _usage_counts(message.usage or {})
+                    if message.message_id is None or usage_snapshots.get(message.message_id) != values:
+                        if message.message_id is not None:
+                            usage_snapshots[message.message_id] = values
+                        logger.info(
+                            "feature_trace_message_usage",
+                            diagnostic_id=diagnostic_id,
+                            stage=stage,
+                            message_id=message.message_id,
+                            model=message.model,
+                            usage_reported=message.usage is not None,
+                            usage_kind="snapshot",
+                            **values,
+                        )
+                if is_trace and isinstance(message, UserMessage) and isinstance(message.content, list):
+                    for block in message.content:
+                        if (
+                            isinstance(block, ToolResultBlock)
+                            and block.is_error
+                            and block.tool_use_id in structured_tool_ids
+                            and block.tool_use_id not in rejected_tool_ids
+                        ):
+                            rejected_tool_ids.add(block.tool_use_id)
+                            logger.warning(
+                                "feature_trace_structured_output_rejected",
+                                diagnostic_id=diagnostic_id,
+                                stage=stage,
+                                tool_use_id=block.tool_use_id,
+                                rejected_attempts=len(rejected_tool_ids),
+                            )
                 if isinstance(message, ResultMessage):
                     result_message = message
+                    if is_trace:
+                        logger.info(
+                            "feature_trace_request_finished",
+                            diagnostic_id=diagnostic_id,
+                            stage=stage,
+                            subtype=message.subtype,
+                            session_id=message.session_id,
+                            num_turns=message.num_turns,
+                            max_turns=options.max_turns,
+                            rejected_attempts=len(rejected_tool_ids),
+                            total_cost_usd=message.total_cost_usd,
+                            **_usage_counts(message.usage or {}),
+                        )
         except Exception as error:
             if result_message is not None and result_message.is_error:
                 raise _agent_result_error(result_message, diagnostic_id, stage) from error
@@ -319,6 +588,12 @@ class AnthropicRepositoryService:
             )
         if result_message.is_error or result_message.subtype != "success":
             raise _agent_result_error(result_message, diagnostic_id, stage)
+        if result_message.structured_output is None:
+            raise AnthropicServiceError(
+                "Claude Agent SDK ended without structured output during "
+                f"{stage.replace('_', ' ')}. Diagnostic ID: {diagnostic_id}.",
+                502,
+            )
         return result_message
 
     async def render_speech(
@@ -525,13 +800,28 @@ def _agent_result_error(
     )
 
 
+def _usage_counts(values: dict[str, Any]) -> dict[str, int]:
+    return {
+        key: value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else 0
+        for key in (
+            "input_tokens",
+            "output_tokens",
+            "cache_read_input_tokens",
+            "cache_creation_input_tokens",
+        )
+        for value in [values.get(key, 0)]
+    }
+
+
 def _agent_usage(usage: dict[str, Any] | None) -> TokenUsage:
-    values = usage or {}
-    input_tokens = values.get("input_tokens", 0)
-    output_tokens = values.get("output_tokens", 0)
+    values = _usage_counts(usage or {})
     return TokenUsage(
-        input_tokens=input_tokens if isinstance(input_tokens, int) else 0,
-        output_tokens=output_tokens if isinstance(output_tokens, int) else 0,
+        input_tokens=(
+            values["input_tokens"]
+            + values["cache_read_input_tokens"]
+            + values["cache_creation_input_tokens"]
+        ),
+        output_tokens=values["output_tokens"],
     )
 
 
@@ -577,6 +867,20 @@ def _friendly_error(
     diagnostic_id: str | None = None,
     stage: str | None = None,
 ) -> AnthropicServiceError:
+    if isinstance(error, TimeoutError):
+        logger.warning(
+            "anthropic_request_timeout",
+            diagnostic_id=diagnostic_id,
+            stage=stage,
+            error_type=type(error).__name__,
+        )
+        resolved_stage = (stage or "response").replace("_", " ")
+        reference = f" Diagnostic ID: {diagnostic_id}." if diagnostic_id else ""
+        return AnthropicServiceError(
+            f"Sentia timed out waiting for Claude during {resolved_stage}. "
+            f"Try again or select a faster model.{reference}",
+            504,
+        )
     if isinstance(error, AuthenticationError):
         return AnthropicServiceError("Anthropic rejected this API key.", 401)
     if isinstance(error, PermissionDeniedError):
@@ -631,6 +935,21 @@ def _friendly_error(
             status_code,
         )
     if isinstance(error, (ValidationError, ValueError)):
+        logger.error(
+            "anthropic_validation_failed",
+            diagnostic_id=diagnostic_id,
+            stage=stage,
+            error_type=type(error).__name__,
+            validation_errors=(
+                [
+                    {"location": list(detail["loc"]), "type": detail["type"]}
+                    for detail in error.errors(include_input=False, include_url=False)
+                ]
+                if isinstance(error, ValidationError)
+                else None
+            ),
+            error_message=None if isinstance(error, ValidationError) else str(error)[:500],
+        )
         resolved_stage = (stage or "response").replace("_", " ")
         reference = f" Diagnostic ID: {diagnostic_id}." if diagnostic_id else ""
         return AnthropicServiceError(

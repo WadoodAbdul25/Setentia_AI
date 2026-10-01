@@ -22,9 +22,12 @@ import {
 import * as vscode from "vscode";
 
 import type { SidecarRuntime } from "./sidecarRuntime.js";
+import type { FlowMapPanelManager } from "./flowMapPanel.js";
+import { explicitFlowMapQuestion } from "./flowMapIntent.js";
 import { DeepgramSpeech } from "./deepgramSpeech.js";
 import { NativeMicrophone } from "./nativeMicrophone.js";
 import { OpenAISpeech } from "./openaiSpeech.js";
+import { prepareWebviewHtml } from "./webviewHtml.js";
 
 export class SentiaViewProvider implements vscode.WebviewViewProvider {
   static readonly viewType = "sentia.sidebar";
@@ -62,6 +65,7 @@ export class SentiaViewProvider implements vscode.WebviewViewProvider {
     private readonly context: vscode.ExtensionContext,
     private readonly runtime: SidecarRuntime,
     private readonly output: vscode.OutputChannel,
+    private readonly flowMaps: FlowMapPanelManager,
   ) {
     this.microphone = new NativeMicrophone(context, output);
     this.deepgramSpeech = new DeepgramSpeech(context, output);
@@ -393,11 +397,20 @@ export class SentiaViewProvider implements vscode.WebviewViewProvider {
         folder.uri.fsPath,
       );
       this.output.appendLine(
-        `[snapshot] watching ${snapshot.workspaceName}: ${String(snapshot.fileCount)} files, ${String(snapshot.directoryCount)} directories`,
+        `[snapshot] watching ${snapshot.workspaceName} at revision ${String(snapshot.repositoryRevision)}: ${String(snapshot.fileCount)} files, ${String(snapshot.directoryCount)} directories`,
       );
     } catch (error) {
       this.output.appendLine(`[snapshot] attach failed: ${String(error)}`);
     }
+  }
+
+  private async openFlowMap(question: string): Promise<void> {
+    const folder = this.requireTrustedWorkspace();
+    const provider = this.agent.selectedProvider;
+    if (!provider) {
+      throw new Error("Choose Claude Code or Codex before opening a Flow Map.");
+    }
+    await this.flowMaps.open(question.trim(), folder, provider);
   }
 
   private async handleMessage(raw: unknown): Promise<void> {
@@ -479,6 +492,16 @@ export class SentiaViewProvider implements vscode.WebviewViewProvider {
             throw new Error(
               "Choose Claude Code or Codex before asking Sentia.",
             );
+          }
+          const flowMapQuestion = explicitFlowMapQuestion(message.question);
+          if (flowMapQuestion) {
+            await this.openFlowMap(flowMapQuestion);
+            this.post({
+              type: "flow_map.opened",
+              requestId: message.requestId,
+              question: flowMapQuestion,
+            });
+            break;
           }
           const answer = await this.runtime.askRepository(
             folder.uri.fsPath,
@@ -919,16 +942,10 @@ export class SentiaViewProvider implements vscode.WebviewViewProvider {
     );
     const indexUri = vscode.Uri.joinPath(root, "index.html");
     try {
-      let html = await readFile(indexUri.fsPath, "utf8");
+      const html = await readFile(indexUri.fsPath, "utf8");
       const baseUri = webview.asWebviewUri(root).toString();
       const nonce = randomBytes(16).toString("base64");
-      html = html.replaceAll("./assets/", `${baseUri}/assets/`);
-      html = html.replace(
-        "<head>",
-        `<head><meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src ${webview.cspSource} data:; style-src ${webview.cspSource} 'unsafe-inline'; script-src 'nonce-${nonce}'; font-src ${webview.cspSource};">`,
-      );
-      html = html.replaceAll("<script ", `<script nonce="${nonce}" `);
-      return html;
+      return prepareWebviewHtml(html, baseUri, webview.cspSource, nonce);
     } catch {
       return `<!doctype html><html><body><h2>Sentia UI is not built</h2><p>Run <code>pnpm build:webview</code>, then reload the window.</p></body></html>`;
     }

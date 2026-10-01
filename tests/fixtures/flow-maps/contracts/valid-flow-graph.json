@@ -1,0 +1,150 @@
+{
+  "schemaVersion": "1",
+  "mapId": "map_login_fixture",
+  "repositoryRevision": 7,
+  "rootEntityIds": ["ent_ts_submit_login"],
+  "viewType": "feature_flow",
+  "nodes": [
+    {
+      "id": "node_submit_login",
+      "entityId": "ent_ts_submit_login",
+      "kind": "function",
+      "label": "submitLogin",
+      "qualifiedName": "submitLogin",
+      "parentNodeId": null,
+      "sourceSpans": [
+        {
+          "path": "frontend/LoginForm.tsx",
+          "startLine": 5,
+          "startColumn": 0,
+          "endLine": 18,
+          "endColumn": 1,
+          "contentHash": "b9530cd042cee05d09e9da449e62a17fe050b411581ee1e214b4511690b2d30c",
+          "repositoryRevision": 7
+        }
+      ],
+      "expandable": true,
+      "hiddenNeighborCount": 0,
+      "metadata": { "language": "typescript" }
+    },
+    {
+      "id": "node_post_api_session",
+      "entityId": "ent_http_post_api_session",
+      "kind": "http_endpoint",
+      "label": "POST /api/session",
+      "qualifiedName": null,
+      "parentNodeId": null,
+      "sourceSpans": [
+        {
+          "path": "frontend/LoginForm.tsx",
+          "startLine": 9,
+          "startColumn": 25,
+          "endLine": 13,
+          "endColumn": 4,
+          "contentHash": "b9530cd042cee05d09e9da449e62a17fe050b411581ee1e214b4511690b2d30c",
+          "repositoryRevision": 7
+        },
+        {
+          "path": "backend/app.py",
+          "startLine": 20,
+          "startColumn": 0,
+          "endLine": 21,
+          "endColumn": 70,
+          "contentHash": "41d413906ae7a4fe9eaa7552d016ac9a752c8997852c015f66b7723f890a0d0e",
+          "repositoryRevision": 7
+        }
+      ],
+      "expandable": false,
+      "hiddenNeighborCount": 0,
+      "metadata": { "method": "POST", "path": "/api/session" }
+    },
+    {
+      "id": "node_create_session",
+      "entityId": "ent_py_create_session",
+      "kind": "function",
+      "label": "create_session",
+      "qualifiedName": "app.create_session",
+      "parentNodeId": null,
+      "sourceSpans": [
+        {
+          "path": "backend/app.py",
+          "startLine": 20,
+          "startColumn": 0,
+          "endLine": 24,
+          "endColumn": 26,
+          "contentHash": "41d413906ae7a4fe9eaa7552d016ac9a752c8997852c015f66b7723f890a0d0e",
+          "repositoryRevision": 7
+        }
+      ],
+      "expandable": true,
+      "hiddenNeighborCount": 2,
+      "metadata": { "language": "python" }
+    }
+  ],
+  "edges": [
+    {
+      "id": "edge_submit_to_http",
+      "sourceNodeId": "node_submit_login",
+      "targetNodeId": "node_post_api_session",
+      "kind": "sends_http_request",
+      "resolution": "framework_inferred",
+      "provenance": {
+        "extractor": "sentia.typescript.http",
+        "extractorVersion": "1.0.0",
+        "ruleId": "fetch.literal_method_path"
+      },
+      "evidence": [
+        {
+          "path": "frontend/LoginForm.tsx",
+          "startLine": 9,
+          "startColumn": 25,
+          "endLine": 13,
+          "endColumn": 4,
+          "contentHash": "b9530cd042cee05d09e9da449e62a17fe050b411581ee1e214b4511690b2d30c",
+          "repositoryRevision": 7
+        }
+      ],
+      "label": "POST /api/session",
+      "conditional": false,
+      "asynchronous": true,
+      "metadata": {}
+    },
+    {
+      "id": "edge_http_to_handler",
+      "sourceNodeId": "node_post_api_session",
+      "targetNodeId": "node_create_session",
+      "kind": "handles_http_request",
+      "resolution": "framework_inferred",
+      "provenance": {
+        "extractor": "sentia.python.fastapi",
+        "extractorVersion": "1.0.0",
+        "ruleId": "fastapi.decorator.literal_method_path"
+      },
+      "evidence": [
+        {
+          "path": "backend/app.py",
+          "startLine": 20,
+          "startColumn": 0,
+          "endLine": 21,
+          "endColumn": 70,
+          "contentHash": "41d413906ae7a4fe9eaa7552d016ac9a752c8997852c015f66b7723f890a0d0e",
+          "repositoryRevision": 7
+        }
+      ],
+      "label": "FastAPI handler",
+      "conditional": false,
+      "asynchronous": true,
+      "metadata": {}
+    }
+  ],
+  "frontiers": [
+    {
+      "nodeId": "node_create_session",
+      "direction": "outgoing",
+      "hiddenNeighborCount": 2,
+      "relationshipKinds": ["calls"]
+    }
+  ],
+  "warnings": [],
+  "generatedAt": "2026-08-17T12:00:00.000Z"
+}

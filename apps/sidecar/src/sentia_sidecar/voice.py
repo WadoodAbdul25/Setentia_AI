@@ -79,12 +79,18 @@ class OpenAIVoiceOptions:
     model: str = "gpt-live-transcribe"
     endpoint: str = "wss://api.openai.com/v1/realtime?model=gpt-realtime"
     sample_rate: int = 24_000
+    silence_duration_ms: int = 5_000
+    speech_rms_threshold: int = 350
 
     def __post_init__(self) -> None:
         if self.model not in OPENAI_TRANSCRIPTION_MODELS:
             raise VoiceError(f"Unsupported OpenAI transcription model: {self.model}")
         if self.sample_rate != 24_000:
             raise VoiceError("OpenAI live transcription requires 24 kHz PCM audio")
+        if not 500 <= self.silence_duration_ms <= 60_000:
+            raise VoiceError("OpenAI silence_duration_ms must be between 500 and 60000")
+        if not 1 <= self.speech_rms_threshold <= 32_767:
+            raise VoiceError("OpenAI speech_rms_threshold must be between 1 and 32767")
 
 
 @dataclass(frozen=True)
@@ -407,12 +413,21 @@ class OpenAIRealtimeTranscriptionConnection:
         self.turns: dict[str, int] = {}
         self.closing = False
         self.finish_requested = False
+        self.completed_turn = False
+        self.commit_in_flight = False
+        self.speech_started = False
+        self.last_speech_at: float | None = None
+        self.silence_duration_seconds = 5.0
+        self.speech_rms_threshold = 350
+        self.endpoint_task: asyncio.Task[None] | None = None
 
     async def configure(
         self,
         options: OpenAIVoiceOptions,
         keyterms: tuple[str, ...],
     ) -> None:
+        self.silence_duration_seconds = options.silence_duration_ms / 1_000
+        self.speech_rms_threshold = options.speech_rms_threshold
         transcription: dict[str, Any] = {"model": options.model, "delay": "low"}
         selected = [
             term.strip()
@@ -492,17 +507,80 @@ class OpenAIRealtimeTranscriptionConnection:
             )
         except ConnectionClosed as error:
             raise VoiceError(f"OpenAI voice connection closed: {error}") from error
+        if not self.commit_in_flight and self._pcm16_rms(audio) >= self.speech_rms_threshold:
+            self._note_speech_activity()
 
     async def close_stream(self) -> None:
         self.finish_requested = True
-        try:
-            await self.socket.send(json.dumps({"type": "input_audio_buffer.commit"}))
-        except ConnectionClosed as error:
-            raise VoiceError(f"OpenAI voice connection closed: {error}") from error
+        if self.completed_turn:
+            self._cancel_endpoint_task()
+            self.closing = True
+            await self.socket.close()
+            return
+        if self.commit_in_flight:
+            return
+        self._cancel_endpoint_task()
+        await self._commit_audio_buffer()
 
     async def close(self) -> None:
+        self._cancel_endpoint_task()
         self.closing = True
         await self.socket.close()
+
+    @staticmethod
+    def _pcm16_rms(audio: bytes) -> float:
+        usable_bytes = len(audio) - (len(audio) % 2)
+        if usable_bytes == 0:
+            return 0
+        samples = memoryview(audio)[:usable_bytes].cast("h")
+        mean_square = sum(sample * sample for sample in samples) / len(samples)
+        return float(mean_square**0.5)
+
+    def _note_speech_activity(self) -> None:
+        if self.closing or self.finish_requested or self.commit_in_flight:
+            return
+        self.speech_started = True
+        self.completed_turn = False
+        self.last_speech_at = asyncio.get_running_loop().time()
+        if self.endpoint_task is None or self.endpoint_task.done():
+            self.endpoint_task = asyncio.create_task(self._commit_after_silence())
+
+    async def _commit_after_silence(self) -> None:
+        try:
+            while self.speech_started and self.last_speech_at is not None:
+                remaining = self.silence_duration_seconds - (
+                    asyncio.get_running_loop().time() - self.last_speech_at
+                )
+                if remaining > 0:
+                    await asyncio.sleep(remaining)
+                    continue
+                await self._commit_audio_buffer()
+                return
+        except asyncio.CancelledError:
+            return
+        finally:
+            if self.endpoint_task is asyncio.current_task():
+                self.endpoint_task = None
+
+    async def _commit_audio_buffer(self) -> None:
+        if self.closing or self.commit_in_flight or self.completed_turn:
+            return
+        self.commit_in_flight = True
+        self.speech_started = False
+        try:
+            await self.socket.send(json.dumps({"type": "input_audio_buffer.commit"}))
+        except asyncio.CancelledError:
+            self.commit_in_flight = False
+            raise
+        except ConnectionClosed as error:
+            self.commit_in_flight = False
+            raise VoiceError(f"OpenAI voice connection closed: {error}") from error
+
+    def _cancel_endpoint_task(self) -> None:
+        task = self.endpoint_task
+        self.endpoint_task = None
+        if task is not None and task is not asyncio.current_task() and not task.done():
+            task.cancel()
 
     def _turn_index(self, item_id: str) -> int:
         if item_id not in self.turns:
@@ -546,10 +624,14 @@ class OpenAIRealtimeTranscriptionConnection:
                     delta = payload.get("delta")
                     if not isinstance(delta, str):
                         continue
+                    self._note_speech_activity()
                     transcript = self.transcripts.get(item_id, "") + delta
                     self.transcripts[item_id] = transcript
                     event = "Update"
                 else:
+                    self.completed_turn = True
+                    self.commit_in_flight = False
+                    self._cancel_endpoint_task()
                     completed_transcript = payload.get("transcript")
                     transcript = (
                         completed_transcript

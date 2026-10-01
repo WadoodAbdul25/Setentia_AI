@@ -1,0 +1,44 @@
+{
+  "schemaVersion": "1",
+  "investigationId": "inv_login_fixture",
+  "repositoryRevision": 7,
+  "question": "Show me the login flow.",
+  "provider": "codex",
+  "selectedFiles": ["frontend/LoginForm.tsx", "backend/app.py"],
+  "readSpans": [
+    {
+      "path": "frontend/LoginForm.tsx",
+      "startLine": 1,
+      "startColumn": 0,
+      "endLine": 18,
+      "endColumn": 1,
+      "contentHash": "b9530cd042cee05d09e9da449e62a17fe050b411581ee1e214b4511690b2d30c",
+      "repositoryRevision": 7
+    },
+    {
+      "path": "backend/app.py",
+      "startLine": 1,
+      "startColumn": 0,
+      "endLine": 24,
+      "endColumn": 26,
+      "contentHash": "41d413906ae7a4fe9eaa7552d016ac9a752c8997852c015f66b7723f890a0d0e",
+      "repositoryRevision": 7
+    }
+  ],
+  "evidence": [
+    {
+      "path": "frontend/LoginForm.tsx",
+      "startLine": 5,
+      "startColumn": 0,
+      "endLine": 18,
+      "endColumn": 1,
+      "contentHash": "b9530cd042cee05d09e9da449e62a17fe050b411581ee1e214b4511690b2d30c",
+      "repositoryRevision": 7
+    }
+  ],
+  "searchQueries": ["login session credentials"],
+  "candidateIdentifiers": ["submitLogin", "create_session"],
+  "initialAnchorEntityIds": ["ent_ts_submit_login"],
+  "coverageAnchorEntityIds": [],
+  "createdAt": "2026-08-17T11:59:00.000Z"
+}

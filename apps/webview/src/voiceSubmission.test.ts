@@ -14,7 +14,7 @@ describe("voice turn submission policy", () => {
     ).toBe("queue");
   });
 
-  it("keeps OpenAI transcription in manual push-to-talk mode", () => {
+  it("queues a completed OpenAI turn for automatic voice submission", () => {
     expect(
       resolveVoiceTurnAction({
         provider: "openai",
@@ -22,7 +22,7 @@ describe("voice turn submission policy", () => {
         isFinal: true,
         transcript: "explain the authentication flow",
       }),
-    ).toBe("ignore");
+    ).toBe("queue");
   });
 
   it("submits either provider after an explicit stop", () => {

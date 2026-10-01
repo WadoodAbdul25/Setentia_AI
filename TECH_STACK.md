@@ -110,6 +110,8 @@ The React application is responsible for:
 | ----------------------- | ---------------------------------------------------------------------------------------------------------------------------- |
 | `react`                 | Component model and UI rendering                                                                                             |
 | `react-dom`             | Mount the React application inside the webview                                                                               |
+| `@xyflow/react`         | Render the dedicated Flow Map editor tab with draggable nodes, directed edges, pan/zoom controls, and a minimap              |
+| `elkjs`                 | Compute deterministic layered Flow Map layouts from the sidecar's host-neutral graph                                         |
 | `zustand`               | Small client-owned state such as current panel, temporary draft, playback state, and connection indicator                    |
 | `@tanstack/react-query` | Cache request/response resources obtained through the extension bridge, such as history, settings, and completed run details |
 | `zod`                   | Validate untrusted messages arriving from the extension host before updating UI state                                        |
@@ -290,20 +292,44 @@ over a vector database.
 
 When the extension attaches to a trusted local workspace, the sidecar writes an
 atomic `.sentia/project-structure.json` file. It contains the workspace name,
-`created_at`, `updated_at`, sorted directory and file paths, and a compact
-per-file metadata manifest containing role, size, priority, imports, and
-top-level symbols. All entries pass Sentia's ignore, dependency,
+`created_at`, `updated_at`, a monotonically increasing repository revision,
+sorted directory and file paths, and a compact per-file metadata manifest
+containing role, size, content hash, priority, imports, and top-level symbols.
+Python files also contribute normalized file, module, class, function, method,
+and nested-function entities with stable IDs, containment parents, exact source
+ranges, file hashes, and repository revisions. All entries pass Sentia's ignore, dependency,
 runtime-artifact, sensitive-path, and symlink rules.
+
+The revision-bound structural index also owns normalized relationship facts.
+Each fact has a stable `rel_` identity, one resolved entity target or an explicit
+unresolved key, typed resolution and provenance, and revision-matched source
+evidence. Repository manifests and snapshots preserve these facts for later
+root-seeded graph traversal; language and framework extractors populate them.
+
+The Flow Map projector performs bounded forward traversal over those facts. It
+prioritizes branches locally using relationship type, identifier overlap with
+the original question and existing investigation candidates, package proximity,
+depth, and fan-out. It preserves cycles and unresolved terminals, adds required
+containment ancestors, and exposes omitted neighbors as lazy frontiers without
+making another model call.
+
+Python relationship extraction is a non-executing second AST pass. Once all
+entities for a revision exist, it resolves lexical and nested functions,
+constructors, awaited calls, `self`/`cls` methods, and explicit absolute or
+relative import aliases. Dynamic receivers, parameters, duplicate declarations,
+and other ambiguous callables are retained as unresolved facts with exact call
+site evidence instead of being guessed.
 
 `watchfiles` observes the workspace while the sidecar is active. File and
 directory create, modify, and delete events rebuild the snapshot and advance
-`updated_at` whenever cached file metadata changes. Reattaching compares the
-live filesystem with the stored JSON, so changes made while Sentia was stopped
-are also captured. The `.sentia` directory is excluded from its own watcher to
-prevent feedback loops. While attached, the validated repository manifest is
-also held in sidecar memory for immediate question routing. Sentia falls back
-to a fresh filesystem scan if the JSON is missing, invalid, or does not match
-the active workspace.
+both `updated_at` and the repository revision whenever indexed facts change.
+Reattaching compares the live filesystem with the stored JSON, so changes made
+while Sentia was stopped are also captured. The `.sentia` directory is excluded
+from its own watcher to prevent feedback loops. While attached, the validated
+repository manifest and normalized entity index are held in sidecar memory for
+immediate question routing and source-location lookup. Sentia falls back to a
+fresh filesystem scan if the JSON is missing, invalid, or does not match the
+active workspace.
 
 ### Deferred retrieval packages
 

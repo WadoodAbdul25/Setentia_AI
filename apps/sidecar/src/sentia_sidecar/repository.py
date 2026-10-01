@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import hashlib
 import json
 import os
 import re
@@ -12,6 +13,15 @@ from detect_secrets.core.secrets_collection import SecretsCollection
 from detect_secrets.settings import default_settings
 from pathspec import PathSpec
 from pathspec.pattern import Pattern
+
+from sentia_sidecar.python_frameworks import extract_python_framework_relationships
+from sentia_sidecar.python_relationships import extract_python_relationships
+from sentia_sidecar.structural_index import (
+    CodeEntity,
+    RelationshipFact,
+    StructuralIndex,
+    extract_python_entities,
+)
 
 ReadMode = Literal["outline", "full"]
 
@@ -154,6 +164,7 @@ class ProjectPaths:
 class RepositoryFile:
     path: str
     size: int
+    content_hash: str
     priority: int
     role: str
     structure: str
@@ -166,6 +177,9 @@ class RepositoryManifest:
     files: dict[str, RepositoryFile]
     description_paths: tuple[str, ...]
     files_scanned: int
+    repository_revision: int = 1
+    entities: tuple[CodeEntity, ...] = ()
+    relationships: tuple[RelationshipFact, ...] = ()
     cache_source: Literal["live", "snapshot"] = "live"
 
 
@@ -183,6 +197,8 @@ class RepositoryContext:
 def build_repository_manifest(
     workspace_path: str,
     project_paths: ProjectPaths | None = None,
+    *,
+    repository_revision: int = 1,
 ) -> RepositoryManifest:
     project_paths = project_paths or discover_project_paths(workspace_path)
     requested_root = Path(workspace_path).expanduser().resolve()
@@ -190,32 +206,58 @@ def build_repository_manifest(
         raise RepositoryError("The project snapshot does not match the selected workspace.")
     root = project_paths.root
     candidates: list[RepositoryFile] = []
+    entities_by_path: dict[str, tuple[CodeEntity, ...]] = {}
+    python_sources_by_path: dict[str, str] = {}
     for relative in project_paths.files:
         path = root / relative
         if not _is_supported(path):
             continue
-        text = _safe_read(path)
-        if text is None:
+        source = _safe_read_source(path)
+        if source is None:
             continue
         role = _file_role(relative, path.name)
         candidates.append(
             RepositoryFile(
                 path=relative,
-                size=len(text.encode("utf-8")),
+                size=source.size,
+                content_hash=source.content_hash,
                 priority=_priority(relative, role),
                 role=role,
-                structure=_extract_structure(path, text),
+                structure=_extract_structure(path, source.text),
             )
         )
+        if path.suffix.lower() == ".py":
+            python_sources_by_path[relative] = source.text
+            entities_by_path[relative] = extract_python_entities(
+                root,
+                relative,
+                source.text,
+                source.content_hash,
+                repository_revision,
+            )
 
     candidates.sort(key=lambda item: (item.priority, item.path.lower()))
     candidates = candidates[:MAX_CANDIDATE_FILES]
     if not candidates:
         raise RepositoryError("No supported Python or JavaScript project files were found.")
+    entities = tuple(
+        entity for candidate in candidates for entity in entities_by_path.get(candidate.path, ())
+    )
+    included_python_sources = {
+        candidate.path: python_sources_by_path[candidate.path]
+        for candidate in candidates
+        if candidate.path in python_sources_by_path
+    }
+    entity_index = StructuralIndex(root, repository_revision, entities)
+    relationships = extract_python_relationships(entity_index, included_python_sources)
+    relationships += extract_python_framework_relationships(entity_index, included_python_sources)
 
     return assemble_repository_manifest(
         root,
         candidates,
+        repository_revision=repository_revision,
+        entities=entities,
+        relationships=relationships,
         cache_source="live",
     )
 
@@ -224,14 +266,30 @@ def assemble_repository_manifest(
     root: Path,
     candidates: list[RepositoryFile],
     *,
+    repository_revision: int = 1,
+    entities: list[CodeEntity] | tuple[CodeEntity, ...] = (),
+    relationships: list[RelationshipFact] | tuple[RelationshipFact, ...] = (),
     cache_source: Literal["live", "snapshot"],
 ) -> RepositoryManifest:
     if not candidates:
         raise RepositoryError("No supported Python or JavaScript project files were found.")
+    if repository_revision < 1:
+        raise RepositoryError("The repository revision must be positive.")
 
     records: list[str] = []
     characters = 0
     included = {candidate.path: candidate for candidate in candidates}
+    if any(
+        entity.path not in included
+        or entity.content_hash != included[entity.path].content_hash
+        or entity.repository_revision != repository_revision
+        for entity in entities
+    ):
+        raise RepositoryError("The structural entities do not match the repository manifest.")
+    try:
+        StructuralIndex(root, repository_revision, entities, relationships)
+    except ValueError as error:
+        raise RepositoryError("The structural facts do not form a valid index.") from error
     for candidate in candidates:
         record = json.dumps(
             {
@@ -258,6 +316,7 @@ def assemble_repository_manifest(
     project_tree = _bounded_project_tree(tuple(included), MAX_TREE_CHARS)
     prompt = (
         f"WORKSPACE ROOT: {root.name}\n"
+        f"REPOSITORY REVISION: {repository_revision}\n"
         f"ELIGIBLE FILES AFTER IGNORE RULES: {len(included)}\n"
         f"ROOT FILES: {', '.join(root_files) or 'none'}\n"
         f"TOP-LEVEL DIRECTORIES: {', '.join(top_level_directories) or 'none'}\n"
@@ -273,6 +332,9 @@ def assemble_repository_manifest(
         files=included,
         description_paths=description_paths,
         files_scanned=len(included),
+        repository_revision=repository_revision,
+        entities=tuple(entities),
+        relationships=tuple(relationships),
         cache_source=cache_source,
     )
 
@@ -579,7 +641,14 @@ def _bounded_project_tree(paths: tuple[str, ...], limit: int) -> str:
     return "\n".join(lines) or "- none"
 
 
-def _safe_read(path: Path) -> str | None:
+@dataclass(frozen=True)
+class _RepositorySource:
+    text: str
+    size: int
+    content_hash: str
+
+
+def _safe_read_source(path: Path) -> _RepositorySource | None:
     try:
         data = path.read_bytes()
     except OSError:
@@ -587,9 +656,19 @@ def _safe_read(path: Path) -> str | None:
     if b"\x00" in data:
         return None
     try:
-        return data.decode("utf-8")
+        text = data.decode("utf-8")
     except UnicodeDecodeError:
         return None
+    return _RepositorySource(
+        text=text,
+        size=len(data),
+        content_hash=hashlib.sha256(data).hexdigest(),
+    )
+
+
+def _safe_read(path: Path) -> str | None:
+    source = _safe_read_source(path)
+    return source.text if source is not None else None
 
 
 def _redact_numbered_lines(

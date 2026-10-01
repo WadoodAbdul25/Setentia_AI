@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -7,17 +8,22 @@ from fastapi.testclient import TestClient
 from sentia_sidecar.agent_runtime import AgentAvailability, AgentRouter
 from sentia_sidecar.anthropic_service import AnthropicRepositoryService
 from sentia_sidecar.app import create_app
+from sentia_sidecar.flow_investigation import FlowRootSelectionResult
 from sentia_sidecar.protocol import (
     PROTOCOL_VERSION,
     AgentProvider,
     EvidenceRange,
+    FlowInvestigationUsage,
+    FlowRootSelection,
     RepositoryAnswer,
+    RepositoryInvestigation,
     TokenUsage,
     WorkingMode,
 )
 from sentia_sidecar.repository import RepositoryManifest
 from sentia_sidecar.repository_intelligence import RepositoryIntelligenceRouter, SpeechAnswer
 from sentia_sidecar.settings import Settings
+from sentia_sidecar.structural_index import StructuralIndex
 from starlette.websockets import WebSocketDisconnect
 
 
@@ -158,6 +164,7 @@ def test_workspace_attach_creates_project_snapshot(
     )
 
     assert response.status_code == 200
+    assert response.json()["repositoryRevision"] == 1
     assert response.json()["workspaceName"] == tmp_path.name
     assert response.json()["snapshotPath"] == ".sentia/project-structure.json"
     assert response.json()["fileCount"] == 1
@@ -193,6 +200,7 @@ class FakeCodexRepositoryService:
 
     def __init__(self) -> None:
         self.questions: list[str] = []
+        self.flow_questions: list[str] = []
         self.speech_requests: list[tuple[str, Path]] = []
 
     async def answer(
@@ -217,6 +225,45 @@ class FakeCodexRepositoryService:
     async def render_speech(self, answer: str, workspace_path: Path) -> SpeechAnswer:
         self.speech_requests.append((answer, workspace_path))
         return SpeechAnswer(spoken_answer="Codex inspected the fixture in spoken form.")
+
+    async def select_flow_roots(
+        self,
+        question: str,
+        repository: RepositoryManifest,
+        index: StructuralIndex,
+    ) -> FlowRootSelectionResult:
+        self.flow_questions.append(question)
+        root = next(entity for entity in index.entities if entity.name == "entry")
+        span = root.flow_source_span()
+        selection = FlowRootSelection(
+            repository_revision=index.repository_revision,
+            root_entity_ids=[root.entity_id],
+            rationale="The entry function starts the requested behavior.",
+        )
+        return FlowRootSelectionResult(
+            investigation=RepositoryInvestigation(
+                investigation_id="inv_fixture",
+                repository_revision=index.repository_revision,
+                question=question,
+                provider=self.provider,
+                selected_files=[root.path],
+                read_spans=[span],
+                evidence=[span],
+                search_queries=[question],
+                candidate_identifiers=[root.qualified_name],
+                initial_anchor_entity_ids=[root.entity_id],
+                created_at=datetime.now(UTC),
+            ),
+            selection=selection,
+            model=self.model,
+            usage=TokenUsage(input_tokens=140, output_tokens=25),
+            investigation_usage=FlowInvestigationUsage(
+                file_selection=TokenUsage(input_tokens=60, output_tokens=10),
+                initial_anchor_selection=TokenUsage(input_tokens=80, output_tokens=15),
+                coverage_pass=TokenUsage(input_tokens=0, output_tokens=0),
+                total=TokenUsage(input_tokens=140, output_tokens=25),
+            ),
+        )
 
 
 def test_anthropic_auth_and_repository_question_flow(
@@ -279,6 +326,47 @@ def test_repository_question_routes_to_selected_codex_provider(
     assert answer.json()["answer"] == "Codex inspected the fixture."
     assert answer.json()["spokenAnswer"] == "Codex inspected the fixture in spoken form."
     assert codex.questions == ["Explain this with Codex."]
+
+
+def test_flow_map_runs_investigation_root_selection_and_local_projection(
+    settings: Settings,
+    auth_headers: dict[str, str],
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "flow.py").write_text(
+        "def entry():\n    worker()\n\ndef worker():\n    return None\n",
+        encoding="utf-8",
+    )
+    codex = FakeCodexRepositoryService()
+    intelligence = RepositoryIntelligenceRouter([codex])
+
+    with TestClient(create_app(settings, repository_router=intelligence)) as test_client:
+        response = test_client.post(
+            "/api/v1/repository/flow-maps",
+            headers=auth_headers,
+            json={
+                "workspacePath": str(tmp_path),
+                "question": "How does entry reach the worker?",
+                "provider": "codex",
+                "maxDepth": 3,
+            },
+        )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["investigation"]["selectedFiles"] == ["flow.py"]
+    assert payload["rootSelection"]["rootEntityIds"] == payload["graph"]["rootEntityIds"]
+    assert payload["graph"]["repositoryRevision"] == payload["investigation"]["repositoryRevision"]
+    assert {node["label"] for node in payload["graph"]["nodes"]} >= {"entry", "worker"}
+    assert [edge["kind"] for edge in payload["graph"]["edges"]] == ["calls"]
+    assert payload["usage"] == {"inputTokens": 140, "outputTokens": 25}
+    assert payload["investigationUsage"] == {
+        "fileSelection": {"inputTokens": 60, "outputTokens": 10},
+        "initialAnchorSelection": {"inputTokens": 80, "outputTokens": 15},
+        "coveragePass": {"inputTokens": 0, "outputTokens": 0},
+        "total": {"inputTokens": 140, "outputTokens": 25},
+    }
+    assert codex.flow_questions == ["How does entry reach the worker?"]
 
 
 def test_speech_render_uses_the_exact_display_answer(

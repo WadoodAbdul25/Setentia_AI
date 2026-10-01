@@ -1,0 +1,23 @@
+{
+  "schemaVersion": "1",
+  "question": "Show me the login flow.",
+  "expectedRoots": [
+    {
+      "path": "frontend/LoginForm.tsx",
+      "qualifiedName": "submitLogin",
+      "kind": "function"
+    }
+  ],
+  "expectedBoundary": {
+    "kind": "http_endpoint",
+    "method": "POST",
+    "path": "/api/session"
+  },
+  "expectedBackendHandler": {
+    "path": "backend/app.py",
+    "qualifiedName": "create_session",
+    "kind": "function"
+  },
+  "expectedBackendCallees": ["verify_credentials", "issue_session"],
+  "dynamicBoundaryExpected": false
+}

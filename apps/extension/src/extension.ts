@@ -1,5 +1,6 @@
 import * as vscode from "vscode";
 
+import { FlowMapPanelManager } from "./flowMapPanel.js";
 import { SentiaViewProvider } from "./sentiaViewProvider.js";
 import { SidecarRuntime } from "./sidecarRuntime.js";
 
@@ -14,12 +15,14 @@ export function activate(context: vscode.ExtensionContext): void {
     onStatus: (status) => providerRef.current?.postStatus(status),
     onVoiceMessage: (message) => providerRef.current?.postVoiceMessage(message),
   });
-  const provider = new SentiaViewProvider(context, runtime, output);
+  const flowMaps = new FlowMapPanelManager(context, runtime, output);
+  const provider = new SentiaViewProvider(context, runtime, output, flowMaps);
   providerRef.current = provider;
 
   context.subscriptions.push(
     output,
     runtime,
+    flowMaps,
     vscode.window.registerWebviewViewProvider(
       SentiaViewProvider.viewType,
       provider,

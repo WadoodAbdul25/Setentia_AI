@@ -250,6 +250,9 @@ Phase 0, Phase 1, and the first Phase 2–3 repository-understanding slice are p
 - Python and JavaScript/TypeScript file inventory with ignore, size, binary,
   symlink, and potential-secret filtering
 - Evidence-backed answers with clickable editor highlights
+- Dedicated Flow Map editor tabs launched only by explicit prompts such as
+  “Create a flow map for authentication,” with ELK layered layout, React Flow
+  navigation, evidence inspection, and click-through source navigation
 - Deepgram Flux `/v2/listen` voice input using native 16 kHz linear PCM
 - Active-file-weighted repository vocabulary, dynamic keyterms, and conservative
   transcript correction metadata
@@ -388,11 +391,13 @@ repository answer, and
 `gpt-4o-mini-tts` speaks the faithful speech rendering of that same answer.
 The full answer and evidence remain visible. The default voice is `marin`; use
 `sentia.voice.openaiVoice` to change it. Sentia labels the output as
-AI-generated in the interface. OpenAI input is push-to-talk: choose **Stop** to
-submit the recording or **Cancel** to discard it without asking the codebase.
-Deepgram Flux automatically queues a detected end-of-turn for voice submission
-after a two-second safety window; choose **Cancel** to discard it or **Send now**
-to submit immediately.
+AI-generated in the interface. Deepgram Flux and Sentia's OpenAI endpoint detector both queue
+a detected end-of-turn for voice submission after a two-second safety window;
+choose **Cancel** to discard it or **Send now** to submit immediately. Because
+`gpt-live-transcribe` does not accept turn detection in this session, Sentia keeps
+OpenAI turn detection disabled and locally commits the audio after five seconds
+without speech. This gives developers room to pause while thinking. Choosing
+**Stop** still commits the current recording immediately for either provider.
 
 ## Coding-agent SDK setup
 
@@ -408,6 +413,13 @@ On first launch, Sentia asks the user to choose **Claude Code** or **Codex** and
 remembers the choice in VS Code global state. Claude uses the masked Anthropic
 key flow. Codex reuses an existing local login or starts the SDK-native OpenAI
 browser login. The user can return to the chooser from the connected state.
+
+For repository explanations and Flow Maps, Sentia uses `SENTIA_CODEX_BIN` when
+set. The VS Code extension supplies the installed OpenAI extension's runtime
+when available. Otherwise Sentia uses `codex` on the sidecar's `PATH`, then the
+SDK's bundled runtime. The
+`codex_client_started` log records the executable used. After upgrading the CLI
+or SDK, restart the sidecar so new requests use the updated runtime.
 
 Choosing Codex now routes both repository explanations and later coding-agent
 runs through Codex. Choosing Claude routes repository explanations through the

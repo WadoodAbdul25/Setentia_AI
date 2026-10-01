@@ -82,9 +82,9 @@ markupsafe==3.0.3
     # via mako
 mcp==1.28.1
     # via claude-agent-sdk
-openai-codex==0.144.4
+openai-codex==0.147.0
     # via sentia-sidecar
-openai-codex-cli-bin==0.144.4
+openai-codex-cli-bin==0.147.0
     # via openai-codex
 pathspec==1.1.1
     # via sentia-sidecar

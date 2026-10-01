@@ -1,6 +1,6 @@
 import type { VoiceProvider } from "@sentia/protocol";
 
-export const DEEPGRAM_AUTO_SUBMIT_DELAY_MS = 2_000;
+export const VOICE_AUTO_SUBMIT_DELAY_MS = 2_000;
 
 export type VoiceTurnAction = "ignore" | "queue" | "submit";
 
@@ -16,5 +16,5 @@ export function resolveVoiceTurnAction(input: {
   if (input.submitRequested) {
     return "submit";
   }
-  return input.provider === "deepgram" ? "queue" : "ignore";
+  return "queue";
 }

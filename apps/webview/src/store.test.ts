@@ -6,9 +6,22 @@ describe("Sentia webview store", () => {
   beforeEach(() => {
     useSentiaStore.setState({
       events: [],
+      flowMapOpened: null,
       workspaceName: null,
       workspaceTrusted: false,
     });
+  });
+
+  it("records an explicitly requested Flow Map without a repository answer", () => {
+    useSentiaStore
+      .getState()
+      .setFlowMapOpened("request-1", "Create a flow map for authentication");
+
+    expect(useSentiaStore.getState().flowMapOpened).toEqual({
+      requestId: "request-1",
+      question: "Create a flow map for authentication",
+    });
+    expect(useSentiaStore.getState().repositoryAnswer).toBeNull();
   });
 
   it("applies extension bootstrap state", () => {

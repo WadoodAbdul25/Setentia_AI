@@ -1,0 +1,253 @@
+{
+  "investigation": {
+    "schemaVersion": "2",
+    "investigationId": "inv_trace_fixture",
+    "repositoryRevision": 1,
+    "question": "Trace seed to saved report",
+    "provider": "codex",
+    "selectedFiles": ["report.py"],
+    "readSpans": [],
+    "evidence": [],
+    "searchQueries": ["report"],
+    "candidateIdentifiers": ["submit", "persist"],
+    "initialAnchorEntityIds": ["ent_submit", "ent_persist"],
+    "coverageAnchorEntityIds": [],
+    "createdAt": "2026-09-13T12:00:00Z"
+  },
+  "rootSelection": {
+    "schemaVersion": "2",
+    "repositoryRevision": 1,
+    "rootEntityIds": ["ent_submit", "ent_persist"],
+    "rationale": "Trace request to persistence.",
+    "unresolvedConcepts": []
+  },
+  "graph": {
+    "schemaVersion": "2",
+    "mapId": "map_trace_fixture",
+    "repositoryRevision": 1,
+    "rootEntityIds": ["ent_submit"],
+    "nodes": [
+      {
+        "id": "node_submit",
+        "entityId": "ent_submit",
+        "kind": "function",
+        "label": "submit",
+        "sourceSpans": []
+      },
+      {
+        "id": "node_persist",
+        "entityId": "ent_persist",
+        "kind": "function",
+        "label": "persist",
+        "sourceSpans": []
+      }
+    ],
+    "edges": [
+      {
+        "id": "edge_submit_persist",
+        "sourceNodeId": "node_submit",
+        "targetNodeId": "node_persist",
+        "kind": "calls",
+        "resolution": "statically_resolved",
+        "provenance": {
+          "extractor": "sentia.python.ast",
+          "extractorVersion": "1.0.0",
+          "ruleId": "python.call.local"
+        },
+        "evidence": [
+          {
+            "path": "report.py",
+            "startLine": 2,
+            "startColumn": 4,
+            "endLine": 2,
+            "endColumn": 24,
+            "contentHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "repositoryRevision": 1
+          }
+        ]
+      }
+    ],
+    "frontiers": [],
+    "warnings": [],
+    "generatedAt": "2026-09-13T12:00:00Z"
+  },
+  "model": "fixture-model",
+  "usage": {
+    "inputTokens": 200,
+    "outputTokens": 40
+  },
+  "investigationUsage": {
+    "fileSelection": {
+      "inputTokens": 0,
+      "outputTokens": 0
+    },
+    "initialAnchorSelection": {
+      "inputTokens": 100,
+      "outputTokens": 20
+    },
+    "coveragePass": {
+      "inputTokens": 100,
+      "outputTokens": 20
+    },
+    "total": {
+      "inputTokens": 200,
+      "outputTokens": 40
+    }
+  },
+  "featureTrace": {
+    "schemaVersion": "2",
+    "traceId": "trace_fixture",
+    "repositoryRevision": 1,
+    "scope": "feature",
+    "requestedOutcome": "Save report content from the submitted seed.",
+    "stackProfile": {
+      "repositoryRevision": 1,
+      "languages": ["Python"],
+      "limitations": [],
+      "technologies": [
+        {
+          "name": "FastAPI",
+          "category": "webFramework",
+          "status": "observed",
+          "paths": ["report.py"],
+          "adapterSupport": "partial"
+        },
+        {
+          "name": "FastAPI",
+          "category": "webFramework",
+          "status": "declared",
+          "paths": ["pyproject.toml"],
+          "adapterSupport": "partial"
+        }
+      ]
+    },
+    "stages": [
+      {
+        "id": "input",
+        "label": "Receive seed",
+        "reviewStatus": "source_reviewed",
+        "responsibility": "Accept the report seed.",
+        "inclusionReason": "Controls input to report generation.",
+        "role": "entry",
+        "entityIds": ["ent_submit"],
+        "evidence": [
+          {
+            "path": "report.py",
+            "startLine": 1,
+            "startColumn": 0,
+            "endLine": 2,
+            "endColumn": 24,
+            "contentHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "repositoryRevision": 1
+          }
+        ]
+      },
+      {
+        "id": "outcome",
+        "label": "Save report",
+        "reviewStatus": "source_reviewed",
+        "responsibility": "Persist generated report content.",
+        "inclusionReason": "Stores the requested output.",
+        "role": "outcome",
+        "entityIds": ["ent_persist"],
+        "evidence": [
+          {
+            "path": "report.py",
+            "startLine": 5,
+            "startColumn": 0,
+            "endLine": 7,
+            "endColumn": 12,
+            "contentHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "repositoryRevision": 1
+          }
+        ]
+      }
+    ],
+    "transitions": [
+      {
+        "id": "transition_input_outcome",
+        "sourceStageId": "input",
+        "targetStageId": "outcome",
+        "relationshipIds": ["rel_fixture"],
+        "kind": "execution",
+        "evidence": [
+          {
+            "path": "report.py",
+            "startLine": 2,
+            "startColumn": 4,
+            "endLine": 2,
+            "endColumn": 24,
+            "contentHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "repositoryRevision": 1
+          }
+        ]
+      }
+    ],
+    "gaps": [],
+    "status": "supported",
+    "stopReason": "coverage_satisfied",
+    "usage": [
+      {
+        "stage": "planning",
+        "inputTokens": 100,
+        "outputTokens": 20
+      },
+      {
+        "stage": "review",
+        "inputTokens": 100,
+        "outputTokens": 20
+      }
+    ],
+    "limitations": ["Static evidence does not guarantee runtime execution."],
+    "featureSpecification": {
+      "actor": "User",
+      "input": "Seed content",
+      "behavior": "Generate report content",
+      "outcome": "Persist generated report",
+      "alternatives": ["Initialize blank report"],
+      "openQuestions": []
+    },
+    "candidates": [
+      {
+        "entityId": "ent_submit",
+        "name": "submit",
+        "decision": "include",
+        "responsibility": "Accept the report seed.",
+        "reason": "Controls input to report generation.",
+        "question": "",
+        "sourceReviewed": true,
+        "evidence": [
+          {
+            "path": "report.py",
+            "startLine": 1,
+            "startColumn": 0,
+            "endLine": 2,
+            "endColumn": 24,
+            "contentHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "repositoryRevision": 1
+          }
+        ]
+      },
+      {
+        "entityId": "ent_persist",
+        "name": "persist",
+        "decision": "include",
+        "responsibility": "Persist generated report content.",
+        "reason": "Stores the requested output.",
+        "question": "",
+        "sourceReviewed": true,
+        "evidence": [
+          {
+            "path": "report.py",
+            "startLine": 5,
+            "startColumn": 0,
+            "endLine": 7,
+            "endColumn": 12,
+            "contentHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "repositoryRevision": 1
+          }
+        ]
+      }
+    ]
+  }
+}

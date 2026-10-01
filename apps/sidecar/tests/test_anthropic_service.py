@@ -7,9 +7,18 @@ from typing import Any
 import httpx
 import pytest
 import respx
-from claude_agent_sdk import ClaudeAgentOptions, ResultMessage, StreamEvent
+from claude_agent_sdk import (
+    AssistantMessage,
+    ClaudeAgentOptions,
+    ResultMessage,
+    StreamEvent,
+    ToolResultBlock,
+    ToolUseBlock,
+    UserMessage,
+)
 from sentia_sidecar.anthropic_service import AnthropicRepositoryService, AnthropicServiceError
 from sentia_sidecar.repository import build_repository_manifest
+from sentia_sidecar.structural_index import StructuralIndex
 from structlog.testing import capture_logs
 
 MODEL = "claude-haiku-4-5-20251001"
@@ -173,6 +182,83 @@ async def test_answer_uses_bounded_manifest_selection_and_content_read(tmp_path:
     assert validated["total_elapsed_ms"] >= 0
 
 
+async def test_flow_root_selection_returns_auditable_investigation_without_ai_keywords(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "service.py").write_text(
+        "def entry():\n    worker()\n\ndef worker():\n    return None\n",
+        encoding="utf-8",
+    )
+    manifest = build_repository_manifest(str(tmp_path))
+    index = StructuralIndex(
+        manifest.root,
+        manifest.repository_revision,
+        manifest.entities,
+        manifest.relationships,
+    )
+    entry = next(entity for entity in index.entities if entity.name == "entry")
+    calls: list[str] = []
+
+    async def fake_query(*, prompt: str, options: ClaudeAgentOptions) -> AsyncIterator[object]:
+        calls.append(prompt)
+        if "ROOT CANDIDATE CATALOG" not in prompt:
+            yield _result(
+                {
+                    "files": [
+                        {
+                            "path": "service.py",
+                            "readMode": "full",
+                            "reason": "Contains the feature entry point.",
+                        }
+                    ],
+                    "rationale": "Read the feature implementation.",
+                },
+                input_tokens=90,
+                output_tokens=15,
+            )
+            return
+        assert options.output_format is not None
+        allowed_ids = options.output_format["schema"]["properties"]["rootEntityIds"]["items"][
+            "enum"
+        ]
+        assert entry.entity_id in allowed_ids
+        assert set(allowed_ids) <= {entity.entity_id for entity in index.entities}
+        assert "ent_invented" not in allowed_ids
+        yield _result(
+            {
+                "rootEntityIds": [entry.entity_id],
+                "rationale": "entry starts the requested behavior.",
+                "unresolvedConcepts": [],
+            },
+            input_tokens=110,
+            output_tokens=10,
+        )
+
+    service = AnthropicRepositoryService(MODEL, query_function=fake_query)
+    await service.connect("sk-ant-test", validate=False)
+
+    result = await service.select_flow_roots(
+        "How does entry reach worker?",
+        manifest,
+        index,
+    )
+
+    assert len(calls) == 2
+    assert entry.entity_id in calls[1]
+    assert result.selection.root_entity_ids == [entry.entity_id]
+    assert result.investigation.selected_files == ["service.py"]
+    assert result.investigation.candidate_identifiers == ["entry"]
+    assert result.investigation.search_queries == ["How does entry reach worker?"]
+    assert result.investigation.read_spans
+    assert result.usage.input_tokens == 200
+    assert result.usage.output_tokens == 25
+    assert result.investigation.initial_anchor_entity_ids == [entry.entity_id]
+    assert result.investigation.coverage_anchor_entity_ids == []
+    assert result.investigation_usage.file_selection.input_tokens == 90
+    assert result.investigation_usage.initial_anchor_selection.input_tokens == 110
+    assert result.investigation_usage.coverage_pass.input_tokens == 0
+
+
 async def test_anthropic_speech_stream_yields_partial_text(tmp_path: Path) -> None:
     calls: list[ClaudeAgentOptions] = []
 
@@ -251,6 +337,147 @@ async def test_invalid_agent_structured_output_has_correlated_diagnostics(
     assert failure["stage"] == "repository_answer"
     assert failure["validation_errors"][0]["location"] == "recommendedMode"
     assert failure["diagnostic_id"] in str(raised.value)
+
+
+async def test_feature_trace_planning_timeout_reports_stage(tmp_path: Path) -> None:
+    (tmp_path / "service.py").write_text("def generate():\n    return 'report'\n")
+    manifest = build_repository_manifest(str(tmp_path))
+    index = StructuralIndex(
+        manifest.root, manifest.repository_revision, manifest.entities, manifest.relationships
+    )
+
+    async def fake_query(**_: Any) -> AsyncIterator[object]:
+        raise TimeoutError()
+        yield  # pragma: no cover
+
+    service = AnthropicRepositoryService(MODEL, query_function=fake_query)
+    await service.connect("sk-ant-test", validate=False)
+    with capture_logs() as logs, pytest.raises(AnthropicServiceError) as raised:
+        await service.trace_feature("Generate a report", manifest, index)
+
+    assert raised.value.status_code == 504
+    assert "timed out waiting for Claude during feature trace planning" in str(raised.value)
+    failure = next(item for item in logs if item["event"] == "anthropic_request_timeout")
+    assert failure["stage"] == "feature_trace_planning"
+    assert failure["diagnostic_id"] in str(raised.value)
+
+
+async def test_trace_limits_and_usage_survive_failed_query(tmp_path: Path) -> None:
+    closed = False
+
+    async def fake_query(*, prompt: str, options: ClaudeAgentOptions) -> AsyncIterator[object]:
+        nonlocal closed
+        assert options.max_turns == 4
+        assert options.effort == "low"
+        assert options.max_budget_usd == 0.50
+        assert options.env["CLAUDE_CODE_MAX_OUTPUT_TOKENS"] == "4096"
+        try:
+            yield AssistantMessage(
+                content=[],
+                model=MODEL,
+                message_id="message-test",
+                usage={
+                    "input_tokens": 20,
+                    "cache_read_input_tokens": 500,
+                    "cache_creation_input_tokens": 100,
+                    "output_tokens": 30,
+                },
+            )
+            raise TimeoutError()
+        finally:
+            closed = True
+
+    service = AnthropicRepositoryService(MODEL, query_function=fake_query)
+    await service.connect("sk-ant-test", validate=False)
+    with capture_logs() as logs, pytest.raises(TimeoutError):
+        await service._run_structured_turn(
+            prompt="private source",
+            system_prompt="private instructions",
+            response_schema={},
+            workspace_path=tmp_path,
+            diagnostic_id="test-timeout",
+            stage="feature_trace_planning",
+        )
+    assert closed
+    usage = next(item for item in logs if item["event"] == "feature_trace_message_usage")
+    assert usage["cache_read_input_tokens"] == 500
+    assert usage["cache_creation_input_tokens"] == 100
+    assert usage["diagnostic_id"] == "test-timeout"
+    assert "private source" not in str(logs)
+
+
+async def test_trace_usage_snapshots_and_schema_rejections_are_not_duplicated(tmp_path: Path) -> None:
+    async def fake_query(**_: Any) -> AsyncIterator[object]:
+        for output_tokens in [1, 1, 30]:
+            yield AssistantMessage(
+                content=[ToolUseBlock(id="call-1", name="StructuredOutput", input={"private": "code"})],
+                model=MODEL,
+                message_id="message-1",
+                usage={"input_tokens": 20, "output_tokens": output_tokens},
+            )
+        for _ in range(2):
+            yield UserMessage(content=[ToolResultBlock(
+                tool_use_id="call-1", is_error=True, content="private validation details"
+            )])
+        yield _result({}, input_tokens=50, output_tokens=40, num_turns=3)
+
+    service = AnthropicRepositoryService(MODEL, query_function=fake_query)
+    await service.connect("sk-ant-test", validate=False)
+    with capture_logs() as logs:
+        result = await service._run_structured_turn(
+            prompt="private source",
+            system_prompt="private instructions",
+            response_schema={},
+            workspace_path=tmp_path,
+            diagnostic_id="test-usage",
+            stage="feature_trace_review",
+        )
+
+    snapshots = [item for item in logs if item["event"] == "feature_trace_message_usage"]
+    assert [item["output_tokens"] for item in snapshots] == [1, 30]
+    assert all(item["usage_kind"] == "snapshot" for item in snapshots)
+    rejections = [item for item in logs if item["event"] == "feature_trace_structured_output_rejected"]
+    assert len(rejections) == 1
+    finished = next(item for item in logs if item["event"] == "feature_trace_request_finished")
+    assert finished["rejected_attempts"] == 1
+    assert finished["output_tokens"] == 40
+    assert result.usage == {"input_tokens": 50, "output_tokens": 40}
+    assert "private" not in str(logs)
+
+
+@pytest.mark.parametrize("stage", ["feature_trace_planning", "feature_trace_review"])
+async def test_trace_rejects_success_without_structured_output(tmp_path: Path, stage: str) -> None:
+    async def fake_query(**_: Any) -> AsyncIterator[object]:
+        yield _result(None)
+
+    service = AnthropicRepositoryService(MODEL, query_function=fake_query)
+    await service.connect("sk-ant-test", validate=False)
+    with pytest.raises(AnthropicServiceError, match="without structured output") as raised:
+        await service._run_structured_turn(
+            prompt="test",
+            system_prompt="test",
+            response_schema={},
+            workspace_path=tmp_path,
+            diagnostic_id="test-missing-output",
+            stage=stage,
+        )
+    assert raised.value.status_code == 502
+    assert stage.replace("_", " ") in str(raised.value)
+
+
+def test_agent_usage_includes_cached_input() -> None:
+    from sentia_sidecar.anthropic_service import _agent_usage
+
+    usage = _agent_usage(
+        {
+            "input_tokens": 20,
+            "cache_read_input_tokens": 500,
+            "cache_creation_input_tokens": 100,
+            "output_tokens": 30,
+        }
+    )
+    assert usage.input_tokens == 620
+    assert usage.output_tokens == 30
 
 
 async def test_agent_error_result_is_reported_even_when_query_raises_afterward(

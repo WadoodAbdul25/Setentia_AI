@@ -6,6 +6,11 @@ from typing import Protocol, runtime_checkable
 
 from pydantic import ConfigDict, Field
 
+from sentia_sidecar.feature_trace import FeatureTraceResult, FeatureTraceService
+from sentia_sidecar.flow_investigation import (
+    FlowRootSelectionResult,
+    FlowRootSelectionService,
+)
 from sentia_sidecar.protocol import (
     AgentProvider,
     CamelModel,
@@ -14,6 +19,7 @@ from sentia_sidecar.protocol import (
     WorkingMode,
 )
 from sentia_sidecar.repository import ReadMode, RepositoryContext, RepositoryManifest
+from sentia_sidecar.structural_index import StructuralIndex
 
 SYSTEM_PROMPT = """You are Sentia, speaking on behalf of the open codebase,
 an AI companion that helps developers understand a living codebase.
@@ -156,6 +162,35 @@ class RepositoryIntelligenceRouter:
         manifest: RepositoryManifest,
     ) -> RepositoryAnswer:
         return await self.service(provider).answer(question, manifest)
+
+    async def select_flow_roots(
+        self,
+        provider: AgentProvider,
+        question: str,
+        manifest: RepositoryManifest,
+        index: StructuralIndex,
+    ) -> FlowRootSelectionResult:
+        service = self.service(provider)
+        if not isinstance(service, FlowRootSelectionService):
+            raise RepositoryIntelligenceError(
+                f"Flow root selection is not configured for {provider.value}.",
+                400,
+            )
+        return await service.select_flow_roots(question, manifest, index)
+
+    async def trace_feature(
+        self,
+        provider: AgentProvider,
+        question: str,
+        manifest: RepositoryManifest,
+        index: StructuralIndex,
+    ) -> FeatureTraceResult:
+        service = self.service(provider)
+        if not isinstance(service, FeatureTraceService):
+            raise RepositoryIntelligenceError(
+                f"Feature tracing is not configured for {provider.value}.", 400
+            )
+        return await service.trace_feature(question, manifest, index)
 
     async def render_speech(
         self,

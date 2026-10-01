@@ -75,7 +75,7 @@ async def test_openai_realtime_transcription_uses_pcm_and_preserves_deltas() -> 
         OpenAIVoiceOptions(),
         ("AuthMiddleware", "Generic<T>"),
     )
-    await connection.send_audio(b"pcm")
+    await connection.send_audio(b"\x00\x00")
     await connection.close_stream()
     messages = [message async for message in connection.messages()]
 
@@ -94,6 +94,65 @@ async def test_openai_realtime_transcription_uses_pcm_and_preserves_deltas() -> 
     assert commit["type"] == "input_audio_buffer.commit"
     assert messages[-1]["event"] == "EndOfTurn"
     assert messages[-1]["transcript"] == "open the AuthMiddleware"
+    assert socket.closed is True
+
+
+async def test_openai_local_silence_detection_commits_without_server_vad() -> None:
+    socket = FakeOpenAISocket([json.dumps({"type": "session.updated"})])
+    connection = OpenAIRealtimeTranscriptionConnection(socket)  # type: ignore[arg-type]
+
+    await connection.configure(
+        OpenAIVoiceOptions(silence_duration_ms=500),
+        (),
+    )
+    speech = (1_000).to_bytes(2, byteorder="little", signed=True) * 2_400
+    await connection.send_audio(speech)
+    await asyncio.sleep(0.55)
+    await connection.close_stream()
+
+    commits = [
+        json.loads(message)
+        for message in socket.sent
+        if json.loads(message).get("type") == "input_audio_buffer.commit"
+    ]
+    assert len(commits) == 1
+    assert connection.commit_in_flight is True
+
+    await connection.close()
+    assert socket.closed is True
+
+
+async def test_openai_completed_turn_closes_without_duplicate_commit() -> None:
+    socket = FakeOpenAISocket(
+        [
+            json.dumps({"type": "session.updated"}),
+            json.dumps(
+                {
+                    "type": "conversation.item.input_audio_transcription.delta",
+                    "item_id": "item-auto",
+                    "delta": "change the layout",
+                }
+            ),
+            json.dumps(
+                {
+                    "type": "conversation.item.input_audio_transcription.completed",
+                    "item_id": "item-auto",
+                    "transcript": "change the layout",
+                }
+            ),
+        ]
+    )
+    connection = OpenAIRealtimeTranscriptionConnection(socket)  # type: ignore[arg-type]
+
+    await connection.configure(OpenAIVoiceOptions(), ())
+    messages = [message async for message in connection.messages()]
+    await connection.close_stream()
+
+    assert messages[-1]["event"] == "EndOfTurn"
+    assert messages[-1]["transcript"] == "change the layout"
+    assert not any(
+        json.loads(message).get("type") == "input_audio_buffer.commit" for message in socket.sent
+    )
     assert socket.closed is True
 
 
@@ -167,6 +226,7 @@ def fixture_repository(tmp_path: Path) -> RepositoryManifest:
             "src/AuthMiddleware.ts": RepositoryFile(
                 path="src/AuthMiddleware.ts",
                 size=120,
+                content_hash="0" * 64,
                 priority=1,
                 role="source",
                 structure="imports=[none]; top-level symbols=[class:AuthMiddleware@4]",
@@ -174,6 +234,7 @@ def fixture_repository(tmp_path: Path) -> RepositoryManifest:
             "src/SessionStore.ts": RepositoryFile(
                 path="src/SessionStore.ts",
                 size=90,
+                content_hash="1" * 64,
                 priority=2,
                 role="source",
                 structure="imports=[none]; top-level symbols=[class:SessionStore@3]",

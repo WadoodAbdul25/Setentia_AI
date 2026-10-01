@@ -24,6 +24,7 @@ interface SentiaState {
   workspaceName: string | null;
   workspaceTrusted: boolean;
   repositoryAnswer: { requestId: string; payload: RepositoryAnswer } | null;
+  flowMapOpened: { requestId: string; question: string } | null;
   requestError: { requestId: string; error: string } | null;
   voiceStatus: {
     sessionId: string;
@@ -50,6 +51,7 @@ interface SentiaState {
   setOpenAIVoice(openaiVoice: OpenAIVoiceStatus): void;
   setVoiceProvider(voiceProvider: VoiceProvider): void;
   setRepositoryAnswer(requestId: string, payload: RepositoryAnswer): void;
+  setFlowMapOpened(requestId: string, question: string): void;
   setRequestError(requestId: string, error: string): void;
   setSidecar(sidecar: SidecarStatus): void;
   setVoiceStatus(
@@ -88,6 +90,7 @@ export const useSentiaStore = create<SentiaState>((set) => ({
   workspaceName: null,
   workspaceTrusted: false,
   repositoryAnswer: null,
+  flowMapOpened: null,
   requestError: null,
   voiceStatus: null,
   voiceTranscript: null,
@@ -101,7 +104,17 @@ export const useSentiaStore = create<SentiaState>((set) => ({
   setOpenAIVoice: (openaiVoice) => set({ openaiVoice }),
   setVoiceProvider: (voiceProvider) => set({ voiceProvider }),
   setRepositoryAnswer: (requestId, payload) =>
-    set({ repositoryAnswer: { requestId, payload }, requestError: null }),
+    set({
+      repositoryAnswer: { requestId, payload },
+      flowMapOpened: null,
+      requestError: null,
+    }),
+  setFlowMapOpened: (requestId, question) =>
+    set({
+      flowMapOpened: { requestId, question },
+      repositoryAnswer: null,
+      requestError: null,
+    }),
   setRequestError: (requestId, error) =>
     set({ requestError: { requestId, error } }),
   setSidecar: (sidecar) => set({ sidecar }),

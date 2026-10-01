@@ -48,12 +48,20 @@ class EventStore:
 
     @staticmethod
     def _to_envelope(record: EventRecord) -> EventEnvelope:
+        # SQLite drops tzinfo when reloading DateTime(timezone=True). EventStore
+        # writes UTC; restore it on replay so the wire timestamp always has a zone.
+        created_at = record.created_at
+        created_at = (
+            created_at.replace(tzinfo=UTC)
+            if created_at.tzinfo is None
+            else created_at.astimezone(UTC)
+        )
         return EventEnvelope(
             event_id=record.event_id,
             sequence=record.sequence,
             conversation_id=record.conversation_id,
             run_id=record.run_id,
             type=record.event_type,
-            created_at=record.created_at,
+            created_at=created_at,
             payload=record.payload,
         )

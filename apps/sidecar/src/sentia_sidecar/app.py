@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hmac
 import json
+import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
@@ -22,10 +23,12 @@ from sentia_sidecar.agent_runtime import (
     CodexLoginManager,
     create_agent_router,
 )
+from sentia_sidecar.anchor_reconciliation import reconcile_anchors
 from sentia_sidecar.anthropic_service import AnthropicRepositoryService, AnthropicServiceError
 from sentia_sidecar.codex_service import CodexRepositoryService
 from sentia_sidecar.database import Database
 from sentia_sidecar.events import EventStore
+from sentia_sidecar.flow_graph import FlowTraversalPolicy, build_feature_flow
 from sentia_sidecar.logging_config import configure_logging
 from sentia_sidecar.models import Conversation
 from sentia_sidecar.protocol import (
@@ -38,6 +41,8 @@ from sentia_sidecar.protocol import (
     ConversationResponse,
     DeepgramCredentialSet,
     DeepgramCredentialStatus,
+    FlowMapRequest,
+    FlowMapResponse,
     HealthResponse,
     OpenAIVoiceCredentialSet,
     OpenAIVoiceCredentialStatus,
@@ -61,6 +66,7 @@ from sentia_sidecar.snapshot import (
     SnapshotError,
     load_snapshot_project_paths,
 )
+from sentia_sidecar.structural_index import StructuralIndex
 from sentia_sidecar.voice import (
     FLUX_EVENTS,
     DeepgramFluxGateway,
@@ -120,6 +126,7 @@ def create_app(
         await events.publish(
             "repository.snapshot_updated",
             {
+                "repositoryRevision": status.repository_revision,
                 "workspaceName": status.workspace_name,
                 "snapshotPath": status.snapshot_path,
                 "updatedAt": status.updated_at.isoformat(),
@@ -391,6 +398,116 @@ def create_app(
         )
         await events.publish("workflow.state", {"state": WorkflowState.READY})
         return answer
+
+    @app.post(
+        "/api/v1/repository/flow-maps",
+        response_model=FlowMapResponse,
+        dependencies=auth_dependencies,
+    )
+    async def create_flow_map(body: FlowMapRequest) -> FlowMapResponse:
+        flow_map_started = time.perf_counter()
+        feature_trace = None
+        await events.publish("workflow.state", {"state": WorkflowState.INDEXING})
+        try:
+            repository = await snapshots.manifest(body.workspace_path)
+            if repository is None:
+                project_paths = await asyncio.to_thread(
+                    load_snapshot_project_paths,
+                    body.workspace_path,
+                )
+                repository = await asyncio.to_thread(
+                    build_repository_manifest,
+                    body.workspace_path,
+                    project_paths,
+                )
+            index = StructuralIndex(
+                repository.root,
+                repository.repository_revision,
+                repository.entities,
+                repository.relationships,
+            )
+            await events.publish(
+                "repository.indexed",
+                {
+                    "filesScanned": repository.files_scanned,
+                    "entityCount": len(index.entities),
+                    "relationshipCount": len(index.relationships),
+                    "cacheSource": repository.cache_source,
+                },
+            )
+            await events.publish("workflow.state", {"state": WorkflowState.DISCUSSING})
+            if body.engine_version == "2":
+                trace_result = await intelligence.trace_feature(
+                    body.provider, body.question, repository, index
+                )
+                roots = trace_result.roots
+                feature_trace = trace_result.trace
+            else:
+                roots = await intelligence.select_flow_roots(
+                    body.provider, body.question, repository, index
+                )
+            reconciliation = reconcile_anchors(index, roots.selection)
+            graph = build_feature_flow(
+                index,
+                roots.selection,
+                question=body.question,
+                candidate_identifiers=roots.investigation.candidate_identifiers,
+                policy=FlowTraversalPolicy(
+                    max_depth=body.max_depth,
+                    max_nodes=body.max_nodes,
+                    max_edges=body.max_edges,
+                    max_branches_per_node=body.max_branches_per_node,
+                ),
+                reconciliation=reconciliation,
+            )
+        except RepositoryError as error:
+            await events.publish("workflow.state", {"state": WorkflowState.FAILED})
+            raise HTTPException(status_code=400, detail=str(error)) from error
+        except RepositoryIntelligenceError as error:
+            await events.publish("workflow.state", {"state": WorkflowState.FAILED})
+            raise HTTPException(status_code=error.status_code, detail=str(error)) from error
+        except ValueError as error:
+            await events.publish("workflow.state", {"state": WorkflowState.FAILED})
+            raise HTTPException(status_code=422, detail=str(error)) from error
+
+        result = FlowMapResponse(
+            investigation=roots.investigation,
+            root_selection=roots.selection,
+            graph=graph,
+            model=roots.model,
+            usage=roots.usage,
+            investigation_usage=roots.investigation_usage,
+            feature_trace=feature_trace,
+        )
+        logger.info(
+            "flow_map_generated",
+            provider=body.provider,
+            repository_revision=graph.repository_revision,
+            selected_files=roots.investigation.selected_files,
+            initial_anchor_entity_ids=roots.investigation.initial_anchor_entity_ids,
+            coverage_anchor_entity_ids=roots.investigation.coverage_anchor_entity_ids,
+            final_anchor_entity_ids=roots.selection.root_entity_ids,
+            anchor_reconciliation=reconciliation.diagnostics_metadata(),
+            visible_graph_entity_ids=[node.entity_id for node in graph.nodes],
+            visible_graph_edge_ids=[edge.id for edge in graph.edges],
+            visible_graph_relationship_kinds=[edge.kind for edge in graph.edges],
+            input_tokens=roots.usage.input_tokens,
+            output_tokens=roots.usage.output_tokens,
+            generation_elapsed_ms=round((time.perf_counter() - flow_map_started) * 1_000, 2),
+        )
+        await events.publish(
+            "repository.flow_map_generated",
+            {
+                "provider": body.provider,
+                "mapId": graph.map_id,
+                "repositoryRevision": graph.repository_revision,
+                "rootEntityIds": graph.root_entity_ids,
+                "nodeCount": len(graph.nodes),
+                "edgeCount": len(graph.edges),
+            },
+        )
+        await events.publish("workflow.state", {"state": WorkflowState.READY})
+        return result
 
     @app.post(
         "/api/v1/voice/render",
