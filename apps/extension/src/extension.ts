@@ -14,6 +14,8 @@ export function activate(context: vscode.ExtensionContext): void {
     onEvent: (event) => providerRef.current?.postEvent(event),
     onStatus: (status) => providerRef.current?.postStatus(status),
     onVoiceMessage: (message) => providerRef.current?.postVoiceMessage(message),
+    onLiveKitPlayback: (event) =>
+      providerRef.current?.postLiveKitPlayback(event),
   });
   const flowMaps = new FlowMapPanelManager(context, runtime, output);
   const provider = new SentiaViewProvider(context, runtime, output, flowMaps);

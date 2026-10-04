@@ -19,6 +19,7 @@ import {
   repositoryAnswerSchema,
   spokenAnswerSchema,
   voiceServerMessageSchema,
+  liveKitServerControlSchema,
   workflowStateSchema,
   type AgentConnectionStatus,
   type AgentLoginStart,
@@ -44,7 +45,13 @@ export interface SidecarRuntimeListener {
   onEvent(event: EventEnvelope): void;
   onStatus(status: SidecarStatus): void;
   onVoiceMessage(message: VoiceServerMessage): void;
+  onLiveKitPlayback?(event: LiveKitPlaybackEvent): void;
 }
+
+export type LiveKitPlaybackEvent =
+  | { type: "audio"; sessionId: string; data: Buffer }
+  | { type: "start" | "flush" | "clear"; sessionId: string; segmentId: string }
+  | { type: "cancel"; sessionId: string };
 
 export interface VoiceSessionOptions {
   sessionId: string;
@@ -56,6 +63,10 @@ export interface VoiceSessionOptions {
   languageHints: string[];
   encoding: "linear16";
   sampleRate: number;
+  pipeline?: "native" | "livekit";
+  ttsModel?: string;
+  ttsVoice?: string;
+  ttsEndpoint?: string;
 }
 
 interface LaunchCommand {
@@ -71,6 +82,15 @@ export class SidecarRuntime implements vscode.Disposable {
   private voiceSessionId: string | undefined;
   private voiceQueue: Buffer[] = [];
   private voiceQueueBytes = 0;
+  private liveKitSessionId: string | undefined;
+  private liveKitWorkspacePath: string | undefined;
+  private liveKitAnswer:
+    | {
+        requestId: string;
+        resolve: (answer: RepositoryAnswer) => void;
+        reject: (error: Error) => void;
+      }
+    | undefined;
   private token: string | undefined;
   private port: number | undefined;
   private lastSequence = 0;
@@ -240,6 +260,14 @@ export class SidecarRuntime implements vscode.Disposable {
     );
   }
 
+  async getOpenAIVoiceStatus(): Promise<OpenAIVoiceStatus> {
+    return await this.request(
+      "/api/v1/auth/openai-voice",
+      { method: "GET" },
+      openaiVoiceStatusSchema,
+    );
+  }
+
   async clearOpenAIVoiceKey(): Promise<OpenAIVoiceStatus> {
     return await this.request(
       "/api/v1/auth/openai-voice",
@@ -266,9 +294,18 @@ export class SidecarRuntime implements vscode.Disposable {
       query.append("languageHint", hint);
     }
     const voicePath =
-      options.provider === "deepgram"
-        ? "/api/v1/voice/deepgram/transcribe"
-        : "/api/v1/voice/openai/transcribe";
+      options.pipeline === "livekit" && options.provider === "openai"
+        ? "/api/v1/voice/livekit/session"
+        : options.provider === "deepgram"
+          ? "/api/v1/voice/deepgram/transcribe"
+          : "/api/v1/voice/openai/transcribe";
+    if (options.pipeline === "livekit" && options.provider === "openai") {
+      query.set("ttsModel", options.ttsModel ?? "gpt-4o-mini-tts");
+      query.set("ttsVoice", options.ttsVoice ?? "marin");
+      query.set("ttsEndpoint", options.ttsEndpoint ?? "https://api.openai.com");
+      this.liveKitSessionId = options.sessionId;
+      this.liveKitWorkspacePath = options.workspacePath;
+    }
     const socket = new WebSocket(
       `ws://127.0.0.1:${String(this.port)}${voicePath}?${query.toString()}`,
       { headers: { Authorization: `Bearer ${this.token ?? ""}` } },
@@ -276,16 +313,60 @@ export class SidecarRuntime implements vscode.Disposable {
     this.voiceSocket = socket;
     this.voiceSessionId = options.sessionId;
 
-    socket.on("message", (data) => {
+    socket.on("message", (data, isBinary) => {
+      if (this.voiceSocket !== socket) return;
       try {
+        if (isBinary) {
+          if (this.liveKitSessionId === options.sessionId) {
+            const audio = Array.isArray(data)
+              ? Buffer.concat(data)
+              : Buffer.from(data as ArrayBuffer);
+            this.listener.onLiveKitPlayback?.({
+              type: "audio",
+              sessionId: options.sessionId,
+              data: audio,
+            });
+          }
+          return;
+        }
         const messageText = Array.isArray(data)
           ? Buffer.concat(data).toString("utf8")
           : data instanceof ArrayBuffer
             ? Buffer.from(data).toString("utf8")
             : data.toString("utf8");
-        const parsed = voiceServerMessageSchema.parse(
-          JSON.parse(messageText) as unknown,
-        );
+        const payload: unknown = JSON.parse(messageText);
+        if (this.liveKitSessionId === options.sessionId) {
+          const control = liveKitServerControlSchema.safeParse(payload);
+          if (control.success) {
+            const message = control.data;
+            if (message.sessionId !== options.sessionId) return;
+            if (message.type === "voice.answer") {
+              if (this.liveKitAnswer?.requestId === message.requestId) {
+                this.liveKitAnswer.resolve(message.payload);
+                this.liveKitAnswer = undefined;
+              }
+            } else if (message.type === "voice.complete") {
+              this.closeVoiceSocket();
+            } else {
+              this.listener.onLiveKitPlayback?.({
+                type:
+                  message.type === "voice.audio.start"
+                    ? "start"
+                    : message.type === "voice.audio.flush"
+                      ? "flush"
+                      : "clear",
+                sessionId: options.sessionId,
+                segmentId: message.segmentId,
+              });
+            }
+            return;
+          }
+        }
+        const parsed = voiceServerMessageSchema.parse(payload);
+        if (parsed.type === "voice.error") {
+          this.liveKitAnswer?.reject(new Error(parsed.error));
+          this.liveKitAnswer = undefined;
+        }
         this.listener.onVoiceMessage(parsed);
       } catch (error) {
         this.output.appendLine(
@@ -304,12 +385,7 @@ export class SidecarRuntime implements vscode.Disposable {
       }
     });
     socket.on("close", () => {
-      if (this.voiceSessionId === options.sessionId) {
-        this.voiceSocket = undefined;
-        this.voiceSessionId = undefined;
-        this.voiceQueue = [];
-        this.voiceQueueBytes = 0;
-      }
+      if (this.voiceSocket === socket) this.closeVoiceSocket();
     });
 
     await new Promise<void>((resolve, reject) => {
@@ -370,6 +446,62 @@ export class SidecarRuntime implements vscode.Disposable {
       this.voiceSocket.send(JSON.stringify({ type: "voice.cancel" }));
     }
     this.closeVoiceSocket();
+  }
+
+  isLiveKitSession(sessionId: string | undefined): boolean {
+    return sessionId !== undefined && sessionId === this.liveKitSessionId;
+  }
+
+  cancelLiveKitVoice(): void {
+    if (this.liveKitSessionId) this.cancelVoice(this.liveKitSessionId);
+  }
+
+  acknowledgeLiveKitPlayback(sessionId: string, segmentId: string): void {
+    if (
+      this.isLiveKitSession(sessionId) &&
+      this.voiceSocket?.readyState === WebSocket.OPEN
+    ) {
+      this.voiceSocket.send(
+        JSON.stringify({ type: "voice.playback_finished", segmentId }),
+      );
+    }
+  }
+
+  async askLiveKitRepository(
+    sessionId: string,
+    requestId: string,
+    question: string,
+    provider: AgentProvider,
+    workspacePath: string,
+  ): Promise<RepositoryAnswer> {
+    if (workspacePath !== this.liveKitWorkspacePath) {
+      this.cancelLiveKitVoice();
+      throw new Error("The workspace changed. Record your question again.");
+    }
+    if (
+      !this.isLiveKitSession(sessionId) ||
+      this.voiceSocket?.readyState !== WebSocket.OPEN
+    ) {
+      throw new Error(
+        "The LiveKit voice turn has ended. Record your question again.",
+      );
+    }
+    if (this.liveKitAnswer)
+      throw new Error("A LiveKit voice question is already pending.");
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      return await new Promise<RepositoryAnswer>((resolve, reject) => {
+        this.liveKitAnswer = { requestId, resolve, reject };
+        timer = setTimeout(() => {
+          this.cancelLiveKitVoice();
+        }, 180_000);
+        this.voiceSocket!.send(
+          JSON.stringify({ type: "voice.ask", requestId, question, provider }),
+        );
+      });
+    } finally {
+      clearTimeout(timer);
+    }
   }
 
   async getAgentStatus(
@@ -620,11 +752,30 @@ export class SidecarRuntime implements vscode.Disposable {
   }
 
   private closeVoiceSocket(): void {
-    this.voiceSocket?.close();
+    const socket = this.voiceSocket;
+    const sessionId = this.liveKitSessionId;
     this.voiceSocket = undefined;
     this.voiceSessionId = undefined;
     this.voiceQueue = [];
     this.voiceQueueBytes = 0;
+    this.liveKitSessionId = undefined;
+    this.liveKitWorkspacePath = undefined;
+    this.liveKitAnswer?.reject(
+      new Error(
+        "The LiveKit voice connection closed before the answer was ready.",
+      ),
+    );
+    this.liveKitAnswer = undefined;
+    socket?.close();
+    if (sessionId) {
+      this.listener.onLiveKitPlayback?.({ type: "cancel", sessionId });
+      this.listener.onVoiceMessage({
+        type: "voice.status",
+        sessionId,
+        state: "closed",
+        message: null,
+      });
+    }
   }
 
   private resolveLaunchCommand(): LaunchCommand {

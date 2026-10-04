@@ -185,6 +185,7 @@ class AnthropicRepositoryService:
                         build_selected_repository_context,
                         manifest,
                         requested,
+                        question=question,
                     )
             except TimeoutError as error:
                 raise AnthropicServiceError(
@@ -197,6 +198,8 @@ class AnthropicRepositoryService:
                 evidence_chars=len(repository.prompt),
                 files_read=repository.files_read,
                 selected_files=list(repository.selected_files),
+                omitted_files=list(repository.omitted_files),
+                truncated_files=list(repository.truncated_files),
                 elapsed_ms=content_read_elapsed_ms,
                 timeout_seconds=CONTENT_RETRIEVAL_TIMEOUT_SECONDS,
             )
@@ -387,6 +390,7 @@ class AnthropicRepositoryService:
                         build_selected_repository_context,
                         manifest,
                         requested,
+                        question=question,
                     )
             except TimeoutError as error:
                 raise AnthropicServiceError(

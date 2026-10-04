@@ -378,6 +378,34 @@ speed control is required, choose an `aura-2-*` model instead and set
 
 ## OpenAI Voice setup
 
+On `Cerebras-Sentia`, OpenAI Voice defaults to the local LiveKit pipeline:
+OpenAI transcription → existing Claude/Codex analysis → Cerebras narration →
+OpenAI TTS → native speaker. LiveKit runs inside the private sidecar; a cloud
+room or LiveKit server credentials are not required.
+
+Place `OPENAI_API_KEY` and `CEREBRAS_API_KEY` in the git-ignored
+`apps/sidecar/.env`, then restart the sidecar or reload the extension. Optional
+`CEREBRAS_URL` defaults to `https://api.cerebras.ai/v1`; the narration model is
+`gpt-oss-120b`. OpenAI keys stored in SecretStorage override the environment key
+for the running sidecar. The webview never receives these keys. Cerebras receives
+the question and the repository-derived written answer, but no coding tools.
+
+Select **OpenAI** under **Voice provider** and record/send a question normally.
+The full written answer and evidence appear before speech. Narration streams
+through OpenAI TTS, with "Sentia" pronounced "Sen-shia". Capture still ends per
+question: persistent mic and intelligent interruption are not enabled in this
+phase. Deepgram and typed questions retain their existing paths.
+
+Set `sentia.voice.openaiPipeline` to `native` to use the original flow below.
+That path requires the OpenAI key in SecretStorage for extension-side TTS.
+
+For a small paid provider check without microphone/speaker access or repository
+data, run `.venv/bin/python scripts/check-livekit-voice.py`. It checks STT
+connection configuration and real Cerebras/OpenAI speech generation, not actual
+microphone recognition. Output contains only status, timings, and PCM byte counts.
+
+### Original native OpenAI pipeline
+
 Choose **OpenAI** under **Voice provider**, then select **Connect OpenAI** on the
 microphone button and paste an OpenAI Platform API key. This key is separate
 from a ChatGPT subscription and from the Codex browser login. Sentia stores it

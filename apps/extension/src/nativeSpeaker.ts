@@ -16,7 +16,7 @@ export class NativeSpeaker implements vscode.Disposable {
     private readonly output: vscode.OutputChannel,
   ) {}
 
-  start(onError: (message: string) => void): void {
+  start(onError: (message: string) => void, onFinished?: () => void): void {
     this.stop();
     if (process.platform !== "darwin") {
       throw new Error(
@@ -46,15 +46,21 @@ export class NativeSpeaker implements vscode.Disposable {
         onError(`Could not start speech playback: ${error.message}`);
       }
     });
-    child.once("exit", (code, signal) => {
-      const expected = this.stopping;
-      if (this.child === child) {
-        this.child = undefined;
+    child.stdin.on("error", (error) => {
+      if (!this.stopping && this.child === child) {
+        onError(`Could not send audio to the speaker: ${error.message}`);
       }
+    });
+    child.once("exit", (code, signal) => {
+      if (this.child !== child) return;
+      const expected = this.stopping;
+      this.child = undefined;
       if (!expected && code !== 0) {
         onError(
           `Speech playback stopped (${String(code ?? signal ?? "unknown error")}).`,
         );
+      } else if (!expected && code === 0) {
+        onFinished?.();
       }
     });
   }

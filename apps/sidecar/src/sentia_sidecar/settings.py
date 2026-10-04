@@ -3,7 +3,7 @@ from __future__ import annotations
 from functools import lru_cache
 from ipaddress import ip_address
 
-from pydantic import Field, SecretStr, field_validator
+from pydantic import AliasChoices, Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -12,6 +12,7 @@ class Settings(BaseSettings):
         env_file=".env",
         env_prefix="SENTIA_",
         extra="ignore",
+        populate_by_name=True,
     )
 
     host: str = "127.0.0.1"
@@ -21,6 +22,17 @@ class Settings(BaseSettings):
     database_url: str = "sqlite+aiosqlite:///./.sentia/sentia.db"
     anthropic_model: str = "claude-haiku-4-5-20251001"
     codex_model: str | None = None
+    openai_api_key: SecretStr | None = Field(
+        default=None, validation_alias=AliasChoices("SENTIA_OPENAI_API_KEY", "OPENAI_API_KEY")
+    )
+    cerebras_api_key: SecretStr | None = Field(
+        default=None, validation_alias=AliasChoices("SENTIA_CEREBRAS_API_KEY", "CEREBRAS_API_KEY")
+    )
+    cerebras_url: str = Field(
+        default="https://api.cerebras.ai/v1",
+        validation_alias=AliasChoices("SENTIA_CEREBRAS_URL", "CEREBRAS_URL"),
+    )
+    cerebras_model: str = "gpt-oss-120b"
 
     @field_validator("host")
     @classmethod
@@ -36,4 +48,6 @@ class Settings(BaseSettings):
 
 @lru_cache
 def get_settings() -> Settings:
-    return Settings()
+    # The development sidecar launches from the repository root. Read its local
+    # credentials without copying them into process-wide environment variables.
+    return Settings(_env_file=(".env", "apps/sidecar/.env"))

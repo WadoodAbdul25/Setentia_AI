@@ -21,12 +21,14 @@ import {
 } from "@sentia/protocol";
 import * as vscode from "vscode";
 
-import type { SidecarRuntime } from "./sidecarRuntime.js";
+import type { SidecarRuntime, LiveKitPlaybackEvent } from "./sidecarRuntime.js";
 import type { FlowMapPanelManager } from "./flowMapPanel.js";
 import { explicitFlowMapQuestion } from "./flowMapIntent.js";
 import { DeepgramSpeech } from "./deepgramSpeech.js";
 import { NativeMicrophone } from "./nativeMicrophone.js";
+import { NativeSpeaker } from "./nativeSpeaker.js";
 import { OpenAISpeech } from "./openaiSpeech.js";
+import { prepareSpeechText } from "./speechText.js";
 import { prepareWebviewHtml } from "./webviewHtml.js";
 
 export class SentiaViewProvider implements vscode.WebviewViewProvider {
@@ -59,6 +61,8 @@ export class SentiaViewProvider implements vscode.WebviewViewProvider {
   private readonly microphone: NativeMicrophone;
   private readonly deepgramSpeech: DeepgramSpeech;
   private readonly openaiSpeech: OpenAISpeech;
+  private readonly liveKitSpeaker: NativeSpeaker;
+  private liveKitPlayback: { sessionId: string; segmentId: string } | undefined;
   private activeVoiceSessionId: string | undefined;
 
   constructor(
@@ -70,6 +74,7 @@ export class SentiaViewProvider implements vscode.WebviewViewProvider {
     this.microphone = new NativeMicrophone(context, output);
     this.deepgramSpeech = new DeepgramSpeech(context, output);
     this.openaiSpeech = new OpenAISpeech(context, output);
+    this.liveKitSpeaker = new NativeSpeaker(context, output);
     this.evidenceDecoration = vscode.window.createTextEditorDecorationType({
       backgroundColor: new vscode.ThemeColor(
         "editor.findMatchHighlightBackground",
@@ -85,6 +90,7 @@ export class SentiaViewProvider implements vscode.WebviewViewProvider {
       this.microphone,
       this.deepgramSpeech,
       this.openaiSpeech,
+      this.liveKitSpeaker,
     );
   }
 
@@ -138,6 +144,13 @@ export class SentiaViewProvider implements vscode.WebviewViewProvider {
 
   postVoiceMessage(message: VoiceServerMessage): void {
     if (
+      message.type === "voice.error" &&
+      this.runtime.isLiveKitSession(message.sessionId)
+    ) {
+      this.liveKitSpeaker.stop();
+      void vscode.window.showWarningMessage(message.error);
+    }
+    if (
       message.type === "voice.error" ||
       (message.type === "voice.status" &&
         (message.state === "closed" || message.state === "error"))
@@ -148,6 +161,49 @@ export class SentiaViewProvider implements vscode.WebviewViewProvider {
       }
     }
     this.post(message);
+  }
+
+  postLiveKitPlayback(event: LiveKitPlaybackEvent): void {
+    if (event.type === "start") {
+      this.liveKitPlayback = {
+        sessionId: event.sessionId,
+        segmentId: event.segmentId,
+      };
+      const playback = this.liveKitPlayback;
+      this.liveKitSpeaker.start(
+        (error) => {
+          if (this.liveKitPlayback !== playback) return;
+          this.runtime.cancelLiveKitVoice();
+          void vscode.window.showWarningMessage(
+            `Sentia displayed the answer, but speech failed: ${error}`,
+          );
+        },
+        () => {
+          if (this.liveKitPlayback !== playback) return;
+          this.runtime.acknowledgeLiveKitPlayback(
+            playback.sessionId,
+            playback.segmentId,
+          );
+          this.liveKitPlayback = undefined;
+        },
+      );
+    } else if (
+      event.type === "audio" &&
+      this.liveKitPlayback?.sessionId === event.sessionId
+    ) {
+      this.liveKitSpeaker.write(event.data);
+    } else if (
+      event.type === "flush" &&
+      this.liveKitPlayback?.segmentId === event.segmentId
+    ) {
+      this.liveKitSpeaker.finish();
+    } else if (
+      (event.type === "clear" || event.type === "cancel") &&
+      this.liveKitPlayback?.sessionId === event.sessionId
+    ) {
+      this.liveKitPlayback = undefined;
+      this.liveKitSpeaker.stop();
+    }
   }
 
   async connectAnthropic(): Promise<void> {
@@ -276,7 +332,7 @@ export class SentiaViewProvider implements vscode.WebviewViewProvider {
   }
 
   async disconnectOpenAIVoice(): Promise<void> {
-    this.openaiSpeech.stop();
+    this.stopSpeech();
     await this.context.secrets.delete(SentiaViewProvider.openaiVoiceSecretKey);
     try {
       this.setOpenAIVoiceStatus(await this.runtime.clearOpenAIVoiceKey());
@@ -495,6 +551,7 @@ export class SentiaViewProvider implements vscode.WebviewViewProvider {
           }
           const flowMapQuestion = explicitFlowMapQuestion(message.question);
           if (flowMapQuestion) {
+            this.runtime.cancelLiveKitVoice();
             await this.openFlowMap(flowMapQuestion);
             this.post({
               type: "flow_map.opened",
@@ -502,6 +559,28 @@ export class SentiaViewProvider implements vscode.WebviewViewProvider {
               question: flowMapQuestion,
             });
             break;
+          }
+          if (
+            message.responseMode === "voice" &&
+            message.voiceSessionId &&
+            this.voiceProvider === "openai" &&
+            vscode.workspace
+              .getConfiguration("sentia.voice")
+              .get<string>("openaiPipeline", "livekit") === "livekit"
+          ) {
+            const answer = await this.runtime.askLiveKitRepository(
+              message.voiceSessionId,
+              message.requestId,
+              message.question,
+              provider,
+              folder.uri.fsPath,
+            );
+            this.post({
+              type: "repository.answer",
+              requestId: message.requestId,
+              payload: answer,
+            });
+            break; // LiveKit owns narration and playback; never also start legacy TTS.
           }
           const answer = await this.runtime.askRepository(
             folder.uri.fsPath,
@@ -534,6 +613,7 @@ export class SentiaViewProvider implements vscode.WebviewViewProvider {
                   `Sentia displayed the answer, but speech failed: ${error}`,
                 );
               };
+              const speechText = prepareSpeechText(answer.spokenAnswer);
               if (selectedVoiceProvider === "deepgram") {
                 try {
                   await this.deepgramSpeech.beginTurn(
@@ -554,7 +634,7 @@ export class SentiaViewProvider implements vscode.WebviewViewProvider {
                     },
                     onSpeechError,
                   );
-                  this.deepgramSpeech.appendText(answer.spokenAnswer);
+                  this.deepgramSpeech.appendText(speechText);
                   this.deepgramSpeech.flushTurn();
                 } catch (error) {
                   this.deepgramSpeech.abortTurn();
@@ -583,7 +663,7 @@ export class SentiaViewProvider implements vscode.WebviewViewProvider {
                     },
                     onSpeechError,
                   );
-                  this.openaiSpeech.appendText(answer.spokenAnswer);
+                  this.openaiSpeech.appendText(speechText);
                   void this.openaiSpeech.flushTurn();
                 } catch (error) {
                   this.openaiSpeech.abortTurn();
@@ -663,6 +743,22 @@ export class SentiaViewProvider implements vscode.WebviewViewProvider {
             languageHints,
             encoding: "linear16",
             sampleRate,
+            pipeline:
+              selectedVoiceProvider === "openai"
+                ? configuration.get<"livekit" | "native">(
+                    "openaiPipeline",
+                    "livekit",
+                  )
+                : "native",
+            ttsModel: configuration.get<string>(
+              "openaiTtsModel",
+              "gpt-4o-mini-tts",
+            ),
+            ttsVoice: configuration.get<string>("openaiVoice", "marin"),
+            ttsEndpoint: configuration.get<string>(
+              "openaiEndpoint",
+              "https://api.openai.com",
+            ),
           });
           this.activeVoiceSessionId = message.sessionId;
           this.microphone.start(
@@ -786,6 +882,9 @@ export class SentiaViewProvider implements vscode.WebviewViewProvider {
   }
 
   private stopSpeech(): void {
+    this.liveKitPlayback = undefined;
+    this.liveKitSpeaker.stop();
+    this.runtime.cancelLiveKitVoice();
     this.deepgramSpeech.cancelPlayback();
     this.openaiSpeech.stop();
   }
@@ -859,7 +958,7 @@ export class SentiaViewProvider implements vscode.WebviewViewProvider {
       SentiaViewProvider.openaiVoiceSecretKey,
     );
     if (!apiKey) {
-      this.setOpenAIVoiceStatus({ connected: false, message: null });
+      this.setOpenAIVoiceStatus(await this.runtime.getOpenAIVoiceStatus());
       return;
     }
     try {

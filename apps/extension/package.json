@@ -141,6 +141,15 @@
           "default": "gpt-live-transcribe",
           "description": "OpenAI model used for live voice transcription."
         },
+        "sentia.voice.openaiPipeline": {
+          "type": "string",
+          "enum": [
+            "livekit",
+            "native"
+          ],
+          "default": "livekit",
+          "description": "LiveKit uses OpenAI transcription, Cerebras narration, and OpenAI TTS in the sidecar. Native retains the original OpenAI voice path."
+        },
         "sentia.voice.openaiRealtimeEndpoint": {
           "type": "string",
           "default": "wss://api.openai.com/v1/realtime?model=gpt-realtime",

@@ -30,6 +30,15 @@ Prefer helping the user build an accurate mental model of the repository before 
 implementation details, unless they asked about a specific function or file.
 Explain purpose, architecture, entry points, pipelines, tech stack, important components, and
 run/test commands when the evidence supports them. Clearly label uncertainty and inference.
+Respect explicit evidence instructions, such as "read the code" or "use only the README".
+For implemented features or runtime behavior, ground claims in the supplied implementation lines;
+documentation alone establishes what is documented or planned, not what is implemented. Tests show
+expected behavior, not proof that they ran successfully. Separate code-supported features from
+documented plans and state when implementation evidence is missing or inconclusive.
+The FILE-SELECTION REPORT is a plan, not proof that those files were read. Only the displayed FILE
+sections below it are evidence. These are bounded excerpts, even in full read mode; do not claim
+to have audited the entire repository or inspected omitted lines. Signatures and outlines alone
+do not establish function behavior.
 Every important repository claim
 must have a citation. Citations may only refer to supplied FILE paths and their displayed line
 numbers. Write inline source references exactly as path:startLine-endLine, using path:startLine for
@@ -101,7 +110,11 @@ representative package manifests, entry points, and implementation files; docume
 supplement that evidence. For a question about a component, behavior, bug, or feature, prioritize
 the relevant implementation and tests. Never choose virtual environments, dependency packages,
 generated files, or caches. Use outline mode for broad codebase understanding and full mode when
-implementation details are necessary. Never invent a path."""
+implementation details are necessary. If the user asks to read the code or list implemented
+features, choose implementation files first and use full mode to inspect their bodies;
+README, vision, roadmap, and session notes are supplementary, not implementation proof.
+Respect documentation-only requests instead of expanding them into a code investigation.
+Never invent a path."""
 
 
 class RepositoryIntelligenceError(RuntimeError):

@@ -11,6 +11,7 @@ import {
   extensionToWebviewMessageSchema,
   flowRootSelectionSchema,
   healthResponseSchema,
+  liveKitServerControlSchema,
   projectSnapshotStatusSchema,
   repositoryInvestigationSchema,
   sentiaFlowGraphSchema,
@@ -155,6 +156,44 @@ describe("Sentia protocol", () => {
         payload: { connected: true, message: "OpenAI Voice is connected." },
       }),
     ).toMatchObject({ type: "openai_voice.status" });
+  });
+
+  it("keeps the captured session ID on a voice question", () => {
+    expect(
+      webviewToExtensionMessageSchema.parse({
+        type: "repository.ask",
+        requestId: "q-1",
+        question: "Explain the project",
+        responseMode: "voice",
+        voiceSessionId: "recording-1",
+      }),
+    ).toMatchObject({ voiceSessionId: "recording-1" });
+  });
+
+  it("validates private LiveKit playback controls and public states", () => {
+    expect(
+      liveKitServerControlSchema.parse({
+        type: "voice.audio.flush",
+        sessionId: "recording-1",
+        segmentId: "segment-1",
+      }),
+    ).toMatchObject({ segmentId: "segment-1" });
+    expect(
+      liveKitServerControlSchema.safeParse({
+        type: "voice.audio.flush",
+        sessionId: "recording-1",
+      }).success,
+    ).toBe(false);
+    for (const state of ["thinking", "speaking"]) {
+      expect(
+        extensionToWebviewMessageSchema.parse({
+          type: "voice.status",
+          sessionId: "recording-1",
+          state,
+          message: null,
+        }),
+      ).toMatchObject({ state });
+    }
   });
 
   it("accepts nullable evidence labels emitted by the Python sidecar", () => {

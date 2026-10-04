@@ -10,7 +10,11 @@ import pytest
 import sentia_sidecar.codex_service as service_module
 from openai_codex import ApprovalMode, Sandbox
 from sentia_sidecar.codex_service import CodexRepositoryService
-from sentia_sidecar.repository import build_repository_manifest
+from sentia_sidecar.repository import (
+    MAX_CONTEXT_CHARS,
+    RepositoryManifest,
+    build_repository_manifest,
+)
 from sentia_sidecar.repository_intelligence import RepositoryIntelligenceError
 from sentia_sidecar.structural_index import StructuralIndex
 from structlog.testing import capture_logs
@@ -140,6 +144,82 @@ async def test_codex_service_reuses_one_client_for_bounded_structured_turns(
     assert validated[1]["client_reused"] is True
     assert validated[1]["selection_elapsed_ms"] >= 0
     assert validated[1]["answer_elapsed_ms"] >= 0
+
+
+async def test_codex_read_code_request_keeps_implementation_after_markdown_first_selection(
+    markdown_first_manifest: RepositoryManifest,
+    monkeypatch: Any,
+) -> None:
+    manifest = markdown_first_manifest
+    documents = ["README.md", "PRODUCT_VISION_V2.md", "SESSIONS.md"]
+    code = [path for path in manifest.files if path.endswith(".py")]
+    prompts: list[str] = []
+    instructions: list[str] = []
+
+    class FakeThread:
+        async def run(self, prompt: str, **kwargs: Any) -> Any:
+            prompts.append(prompt)
+            if "FILE-SELECTION REPORT" not in prompt:
+                result = {
+                    "files": [
+                        {
+                            "path": path,
+                            "readMode": "full" if path in documents else "outline",
+                            "reason": "Selected evidence.",
+                        }
+                        for path in documents + code
+                    ],
+                    "rationale": "Read descriptions followed by implementation.",
+                }
+            else:
+                for index in range(5):
+                    assert f"return 'implemented feature {index}'" in prompt
+                result = {
+                    "answer": "These features have implementation evidence; the vision is a plan.",
+                    "spokenAnswer": "These features have code evidence. The vision is a plan.",
+                    "evidence": [
+                        {"path": path, "startLine": 1, "endLine": 2, "label": "Implementation"}
+                        for path in code
+                    ],
+                    "recommendedMode": "brainstorm",
+                    "modeReason": "The user asked to understand existing code.",
+                }
+            return _turn_result(json.dumps(result), input_tokens=100, output_tokens=20)
+
+    class FakeCodex:
+        def __init__(self, config: Any) -> None:
+            pass
+
+        async def __aenter__(self) -> FakeCodex:
+            return self
+
+        async def close(self) -> None:
+            pass
+
+        async def thread_start(self, **kwargs: Any) -> FakeThread:
+            instructions.append(kwargs["base_instructions"])
+            return FakeThread()
+
+    monkeypatch.setattr(service_module, "AsyncCodex", FakeCodex)
+    service = CodexRepositoryService("codex-test")
+
+    with capture_logs() as logs:
+        answer = await service.answer(
+            "Read the code and tell me what features are present.", manifest
+        )
+    await service.close()
+
+    assert len(prompts) == 2
+    assert "not a full repository audit" in prompts[1]
+    assert "documentation alone" in instructions[1]
+    assert "FILE-SELECTION REPORT is a plan" in instructions[1]
+    assert answer.selected_files[:5] == code
+    assert answer.files_read == 8
+    assert {item.path for item in answer.evidence} == set(code)
+    reader = next(item for item in logs if item["event"] == "content_reader_completed")
+    assert reader["evidence_chars"] <= MAX_CONTEXT_CHARS
+    assert reader["omitted_files"] == []
+    assert set(reader["truncated_files"]) == set(documents + code)
 
 
 async def test_codex_flow_coverage_reuses_root_thread_and_adds_valid_anchors(

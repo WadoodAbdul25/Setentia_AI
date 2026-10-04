@@ -192,6 +192,85 @@ class RepositoryContext:
     files_read: int = 0
     selected_files: tuple[str, ...] = ()
     included_lines: dict[str, frozenset[int]] | None = None
+    omitted_files: tuple[str, ...] = ()
+    truncated_files: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class _EvidenceSection:
+    path: str
+    heading: str
+    lines: list[tuple[int, str]]
+    limit: int
+    weight: int
+    file_line_count: int
+
+
+def _question_evidence_intent(
+    question: str,
+) -> Literal["implementation", "documentation", "general"]:
+    text = " ".join(question.lower().replace("’", "'").split())
+    code_request = re.search(
+        r"\b(?:read|inspect|review|examine|scan|check|look at)\b.{0,30}?"
+        r"\b(?:code|source|implementation)\b(?!\.md)",
+        text,
+    )
+    if re.search(
+        r"\b(?:don't|do not|without|not)\s+(?:read(?:ing)?|inspect(?:ing)?)?\s*"
+        r"(?:the\s+)?(?:source\s+)?code\b",
+        text,
+    ):
+        return "documentation"
+    document_pattern = r"(?:readme(?:\.md)?|docs?|documentation|markdown|[\w./-]+\.md)"
+    documentation = re.search(rf"\b{document_pattern}\b", text)
+    documentation_only = re.search(
+        rf"\b(?:only|solely|just)\s+"
+        rf"(?:(?:read|use|consult|summari[sz]e|consider)\s+)?(?:the\s+)?{document_pattern}\b"
+        rf"|\b{document_pattern}\s+only\b",
+        text,
+    )
+    if documentation and (
+        documentation_only
+        or (
+            not code_request
+            and re.search(
+                r"\b(?:read|according to|summari[sz]e|planned|roadmap|documented)\b", text
+            )
+        )
+    ):
+        return "documentation"
+    if code_request or re.search(
+        r"\b(?:features?|functionality|implemented|implementation|behavio[u]?r|bugs?)\b", text
+    ):
+        return "implementation"
+    return "general"
+
+
+def requires_implementation_evidence(question: str) -> bool:
+    """Identify source/feature requests without overriding documentation-only scope."""
+    return _question_evidence_intent(question) == "implementation"
+
+
+def _share_evidence_budget(limits: list[int], weights: list[int], budget: int) -> list[int]:
+    """Capped weighted shares; redistribute space unused by short files."""
+    shares = [0] * len(limits)
+    remaining = max(0, budget)
+    active = [index for index, limit in enumerate(limits) if limit > 0]
+    while active and remaining:
+        total_weight = sum(weights[index] for index in active)
+        grants = {
+            index: min(limits[index] - shares[index], remaining * weights[index] // total_weight)
+            for index in active
+        }
+        if not any(grants.values()):
+            for index in active[:remaining]:
+                shares[index] += 1
+            break
+        for index, grant in grants.items():
+            shares[index] += grant
+            remaining -= grant
+        active = [index for index in active if shares[index] < limits[index]]
+    return shares
 
 
 def build_repository_manifest(
@@ -379,11 +458,43 @@ def discover_project_paths(workspace_path: str) -> ProjectPaths:
 def build_selected_repository_context(
     manifest: RepositoryManifest,
     requested: list[tuple[str, ReadMode]],
+    *,
+    question: str = "",
 ) -> RepositoryContext:
+    implementation_required = requires_implementation_evidence(question)
+    if _question_evidence_intent(question) == "documentation":
+        requested = [
+            (path, mode)
+            for path, mode in requested
+            if path in manifest.files
+            and manifest.files[path].role in {"description", "documentation"}
+        ] or [
+            (item.path, "full")
+            for item in manifest.files.values()
+            if item.role in {"description", "documentation"}
+        ]
+        if not requested:
+            raise RepositoryError(
+                "Sentia found no documentation for this documentation-only request."
+            )
+    if implementation_required:
+        requested = sorted(
+            requested,
+            key=lambda item: (
+                manifest.files.get(item[0]) is None
+                or manifest.files[item[0]].role not in {"source", "entrypoint"}
+            ),
+        )
     selected = _normalize_selection(manifest, requested)
     sections: list[str] = []
     included_lines: dict[str, frozenset[int]] = {}
-    total_chars = 0
+    prepared: list[_EvidenceSection] = []
+    truncated: list[str] = []
+    prefix = (
+        f"WORKSPACE: {manifest.root.name}\n"
+        "SELECTED REPOSITORY EVIDENCE (budgeted excerpts, not a full repository audit; "
+        "only displayed line numbers may be cited):\n"
+    )
 
     for relative, mode in selected:
         path = manifest.root / relative
@@ -402,31 +513,48 @@ def build_selected_repository_context(
                 else MAX_FULL_FILE_CHARS
             )
         numbered_lines = _redact_numbered_lines(manifest.root, relative, numbered_lines)
-        section_lines, section_chars = _fit_numbered_lines(
-            numbered_lines,
-            min(file_limit, MAX_CONTEXT_CHARS - total_chars),
+        if not numbered_lines:
+            continue
+        role = manifest.files[relative].role
+        prepared.append(
+            _EvidenceSection(
+                path=relative,
+                heading=f"\n### FILE: {relative} (read mode: {mode}; role: {role})\n",
+                lines=numbered_lines,
+                limit=min(file_limit, sum(len(line) + 8 for _, line in numbered_lines)),
+                weight=2 if implementation_required and role in {"source", "entrypoint"} else 1,
+                file_line_count=len(lines),
+            )
+        )
+
+    # Reserve every heading and separator before allocating content. No early
+    # document can consume a later source file's share, even if the model puts
+    # README first. Tiny files give their unused allocation back to the pool.
+    allocations = _share_evidence_budget(
+        [section.limit for section in prepared],
+        [section.weight for section in prepared],
+        MAX_CONTEXT_CHARS - len(prefix) - sum(len(section.heading) + 1 for section in prepared),
+    )
+    for section, allocation in zip(prepared, allocations, strict=True):
+        section_lines, _ = _fit_numbered_lines(
+            section.lines,
+            allocation,
         )
         if not section_lines:
             continue
-        heading = f"\n### FILE: {relative} (read mode: {mode})\n"
-        rendered = heading + "\n".join(
+        rendered = section.heading + "\n".join(
             f"{line_number:>4}: {line}" for line_number, line in section_lines
         )
-        if total_chars + len(rendered) > MAX_CONTEXT_CHARS:
-            continue
         sections.append(rendered)
-        total_chars += len(rendered)
-        included_lines[relative] = frozenset(number for number, _ in section_lines)
+        included_lines[section.path] = frozenset(number for number, _ in section_lines)
+        if len(section_lines) < section.file_line_count:
+            truncated.append(section.path)
 
     if not sections:
         raise RepositoryError("Sentia could not read any of the selected repository files.")
 
     selected_files = tuple(included_lines)
-    prompt = (
-        f"WORKSPACE: {manifest.root.name}\n"
-        "SELECTED REPOSITORY EVIDENCE (only displayed line numbers may be cited):\n"
-        + "\n".join(sections)
-    )
+    prompt = prefix + "\n".join(sections)
     return RepositoryContext(
         root=manifest.root,
         prompt=prompt,
@@ -435,6 +563,8 @@ def build_selected_repository_context(
         files_read=len(selected_files),
         selected_files=selected_files,
         included_lines=included_lines,
+        omitted_files=tuple(path for path, _ in selected if path not in included_lines),
+        truncated_files=tuple(truncated),
     )
 
 
@@ -469,6 +599,20 @@ def expand_repository_selection(
             item.path.lower(),
         ),
     )
+    if _question_evidence_intent(question) == "documentation":
+        selected = [
+            (path, mode)
+            for path, mode in selected
+            if manifest.files[path].role in {"description", "documentation"}
+        ]
+        return (
+            selected
+            or [
+                (item.path, "full")
+                for item in ranked
+                if item.role in {"description", "documentation"}
+            ][:MAX_SELECTED_FILES]
+        )
     relevant_code = [
         item
         for item in ranked
@@ -496,6 +640,22 @@ def expand_repository_selection(
             )
             if len(selected) >= min(4, MAX_SELECTED_FILES):
                 break
+    if requires_implementation_evidence(question):
+        # An eight-document shortlist previously prevented all fallback code
+        # additions. Make room for representative implementation in that case.
+        if not any(manifest.files[path].role in {"source", "entrypoint"} for path, _ in selected):
+            sources = [item for item in ranked if item.role == "source"]
+            entries = [item for item in ranked if item.role == "entrypoint"]
+            candidates = entries[:1] + sources[:1]
+            selected = [(item.path, "full") for item in candidates] + selected
+        selected = sorted(
+            selected,
+            key=lambda item: manifest.files[item[0]].role not in {"source", "entrypoint"},
+        )[:MAX_SELECTED_FILES]
+        selected = [
+            (path, "full" if manifest.files[path].role in {"source", "entrypoint"} else mode)
+            for path, mode in selected
+        ]
     return selected
 
 
@@ -700,6 +860,10 @@ def _fit_numbered_lines(
     characters = 0
     for number, line in lines:
         rendered_length = len(line) + 8
+        if rendered_length > limit:
+            # Keep original line numbers, but do not let a giant line hide all
+            # of the shorter evidence that follows it.
+            continue
         if characters + rendered_length > limit:
             break
         fitted.append((number, line))

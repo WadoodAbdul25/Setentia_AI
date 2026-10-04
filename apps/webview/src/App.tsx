@@ -33,6 +33,7 @@ interface AppProps {
 interface PendingVoiceSubmission {
   transcript: string;
   turnKey: string;
+  sessionId: string;
 }
 
 export function App({ bridge }: AppProps) {
@@ -141,7 +142,11 @@ export function App({ bridge }: AppProps) {
   }
 
   const submitQuestion = useCallback(
-    (value: string, responseMode: "text" | "voice" = "text"): string | null => {
+    (
+      value: string,
+      responseMode: "text" | "voice" = "text",
+      voiceSessionId?: string,
+    ): string | null => {
       const normalized = value.trim();
       if (!normalized) {
         return null;
@@ -153,6 +158,7 @@ export function App({ bridge }: AppProps) {
         requestId,
         question: normalized,
         responseMode,
+        ...(voiceSessionId ? { voiceSessionId } : {}),
       });
       return requestId;
     },
@@ -223,7 +229,7 @@ export function App({ bridge }: AppProps) {
       setPendingVoiceSubmission(null);
       setVoiceSubmitRequested(false);
       setVoiceSessionId(null);
-      submitQuestion(turn.transcript, "voice");
+      submitQuestion(turn.transcript, "voice", turn.sessionId);
     },
     [submitQuestion],
   );
@@ -241,6 +247,7 @@ export function App({ bridge }: AppProps) {
     }
     const turn = {
       turnKey,
+      sessionId: voiceTranscript.sessionId,
       transcript: voiceTranscript.correctedTranscript,
     };
     const action = resolveVoiceTurnAction({
@@ -511,6 +518,8 @@ export function App({ bridge }: AppProps) {
               <p className="voice-disclosure">
                 Spoken output uses an AI-generated OpenAI voice. An OpenAI API
                 key with billing is required separately from ChatGPT or Codex.
+                With the LiveKit pipeline, Cerebras receives your question and
+                written repository answer to prepare the spoken explanation.
               </p>
             ) : null}
             <div className="question-card__heading">
@@ -588,6 +597,11 @@ export function App({ bridge }: AppProps) {
             {pendingVoiceSubmission ? (
               <p className="voice-status" aria-live="polite">
                 End of turn detected. Sending in two seconds—Cancel to discard.
+              </p>
+            ) : voiceStatus?.state === "thinking" ||
+              voiceStatus?.state === "speaking" ? (
+              <p className="voice-status" aria-live="polite">
+                {voiceStatus.message}
               </p>
             ) : voiceSessionId && voiceStatus?.sessionId === voiceSessionId ? (
               <p className="voice-status" aria-live="polite">

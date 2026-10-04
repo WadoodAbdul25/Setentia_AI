@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hmac
 import json
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from pathlib import Path
@@ -12,6 +13,7 @@ from typing import Annotated, Any
 from uuid import uuid4
 
 import structlog
+from anyio import CancelScope
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, WebSocket, WebSocketDisconnect
 from sqlalchemy import select
 from starlette import status
@@ -102,6 +104,7 @@ def create_app(
     codex_login_manager: CodexLogin | None = None,
     flux_gateway: FluxGateway | None = None,
     openai_voice_gateway: OpenAIVoiceGateway | None = None,
+    livekit_turn_factory: Callable[..., Any] | None = None,
 ) -> FastAPI:
     resolved = settings or get_settings()
     expected_token = resolved.token.get_secret_value()
@@ -120,7 +123,9 @@ def create_app(
     deepgram_voice_gateway = flux_gateway or DeepgramFluxGateway()
     openai_transcription_gateway = openai_voice_gateway or OpenAIRealtimeTranscriptionGateway()
     deepgram_api_key: str | None = None
-    openai_voice_api_key: str | None = None
+    openai_voice_api_key: str | None = (
+        resolved.openai_api_key.get_secret_value() if resolved.openai_api_key else None
+    )
 
     async def snapshot_updated(status: ProjectSnapshotStatus, triggers: list[str]) -> None:
         await events.publish(
@@ -563,8 +568,7 @@ def create_app(
                     error_type=type(error).__name__,
                 )
                 yield (
-                    b'{"type":"error","message":'
-                    b'"Sentia could not prepare the spoken response."}\n'
+                    b'{"type":"error","message":"Sentia could not prepare the spoken response."}\n'
                 )
 
         return StreamingResponse(
@@ -899,5 +903,190 @@ def create_app(
         finally:
             if connection is not None:
                 await connection.close()
+
+    @app.websocket("/api/v1/voice/livekit/session")
+    async def livekit_voice_session(
+        websocket: WebSocket,
+        session_id: Annotated[str, Query(alias="sessionId", min_length=1)],
+        workspace_path: Annotated[str, Query(alias="workspacePath", min_length=1)],
+        active_file: Annotated[str | None, Query(alias="activeFile")] = None,
+        model: str = "gpt-live-transcribe",
+        endpoint: str = "wss://api.openai.com/v1/realtime?model=gpt-realtime",
+        tts_model: Annotated[str, Query(alias="ttsModel")] = "gpt-4o-mini-tts",
+        tts_voice: Annotated[str, Query(alias="ttsVoice")] = "marin",
+        tts_endpoint: Annotated[str, Query(alias="ttsEndpoint")] = "https://api.openai.com",
+    ) -> None:
+        supplied = _bearer_token(websocket.headers.get("authorization"))
+        if supplied is None or not hmac.compare_digest(supplied, expected_token):
+            await websocket.close(code=1008, reason="Unauthorized")
+            return
+        if not openai_voice_api_key or not resolved.cerebras_api_key:
+            await websocket.close(
+                code=1008,
+                reason="LiveKit needs OPENAI_API_KEY and CEREBRAS_API_KEY in the sidecar .env.",
+            )
+            return
+        await websocket.accept()
+        turn: Any = None
+        connection: FluxConnection | None = None
+        tasks: set[asyncio.Task[Any]] = set()
+        worker_failed: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+        try:
+            factory = livekit_turn_factory
+            if factory is None:
+                # Load heavy audio/ML packages only when this pipeline is selected.
+                from sentia_sidecar.livekit_voice import LiveKitVoiceTurn
+
+                factory = LiveKitVoiceTurn
+            repository = await snapshots.manifest(workspace_path)
+            if repository is None:
+                repository = await asyncio.to_thread(build_repository_manifest, workspace_path)
+            vocabulary = build_vocabulary(repository, active_file)
+            connection = await openai_transcription_gateway.connect(
+                openai_voice_api_key,
+                OpenAIVoiceOptions(model=model, endpoint=endpoint, sample_rate=24_000),
+                select_keyterms(vocabulary),
+            )
+
+            async def analyze(question: str, provider: str) -> RepositoryAnswer:
+                return await ask_repository(
+                    RepositoryQuestion(
+                        workspace_path=workspace_path,
+                        question=question,
+                        provider=AgentProvider(provider),
+                    )
+                )
+
+            turn = factory(
+                session_id=session_id,
+                connection=connection,
+                corrector=RepositoryTranscriptCorrector(vocabulary),
+                openai_key=openai_voice_api_key,
+                cerebras_key=resolved.cerebras_api_key.get_secret_value(),
+                cerebras_url=resolved.cerebras_url,
+                cerebras_model=resolved.cerebras_model,
+                tts_model=tts_model,
+                tts_voice=tts_voice,
+                tts_url=tts_endpoint.rstrip("/") + "/v1",
+                analyze=analyze,
+            )
+
+            async def write_output() -> None:
+                while True:
+                    payload = await turn.outgoing.get()
+                    if isinstance(payload, bytes):
+                        await websocket.send_bytes(payload)
+                    else:
+                        await websocket.send_json(payload)
+                        if payload.get("type") in {"voice.complete", "voice.error"}:
+                            return
+
+            async def read_input() -> None:
+                finish_task: asyncio.Task[Any] | None = None
+                answer_task: asyncio.Task[Any] | None = None
+                while True:
+                    incoming = await asyncio.wait_for(websocket.receive(), timeout=180)
+                    if incoming["type"] == "websocket.disconnect":
+                        return
+                    audio = incoming.get("bytes")
+                    if isinstance(audio, bytes):
+                        if not turn.finished_recording:
+                            await turn.audio_input.push(audio)
+                        continue
+                    text = incoming.get("text")
+                    if not isinstance(text, str) or len(text) > 8_000:
+                        continue
+                    try:
+                        control = json.loads(text)
+                    except json.JSONDecodeError:
+                        continue
+                    if not isinstance(control, dict):
+                        continue
+                    kind = control.get("type")
+                    if kind == "voice.cancel":
+                        return
+                    if kind == "voice.stop" and finish_task is None:
+                        finish_task = asyncio.create_task(turn.finish_recording())
+                        tasks.add(finish_task)
+                        finish_task.add_done_callback(check_worker)
+                    elif kind == "voice.ask" and answer_task is None:
+                        question = control.get("question")
+                        request_id = control.get("requestId")
+                        provider = control.get("provider")
+                        if (
+                            not isinstance(question, str)
+                            or not 1 <= len(question.strip()) <= 2000
+                            or not isinstance(request_id, str)
+                            or not 1 <= len(request_id) <= 200
+                            or provider not in {"claude", "codex"}
+                        ):
+                            raise VoiceError("Invalid repository question for the voice turn.")
+
+                        async def respond(
+                            submitted_id: str = request_id,
+                            submitted_question: str = question.strip(),
+                            submitted_provider: str = provider,
+                            finishing: asyncio.Task[Any] | None = finish_task,
+                        ) -> None:
+                            if finishing is not None:
+                                await finishing
+                            await turn.answer(submitted_id, submitted_question, submitted_provider)
+
+                        answer_task = asyncio.create_task(respond())
+                        tasks.add(answer_task)
+                        answer_task.add_done_callback(check_worker)
+                    elif kind == "voice.playback_finished":
+                        segment_id = control.get("segmentId")
+                        if isinstance(segment_id, str):
+                            turn.audio_output.acknowledge(segment_id)
+
+                    # Surface task failures without blocking microphone or device acknowledgments.
+                    for task in (finish_task, answer_task):
+                        if task is not None and task.done():
+                            task.result()
+
+            def check_worker(task: asyncio.Task[Any]) -> None:
+                if not task.cancelled() and not worker_failed.done():
+                    error = task.exception()
+                    if error is not None:
+                        worker_failed.set_exception(error)
+
+            await turn.start()
+            reader = asyncio.create_task(read_input())
+            writer = asyncio.create_task(write_output())
+            tasks.update((reader, writer))
+            done, _ = await asyncio.wait(
+                {reader, writer, worker_failed}, return_when=asyncio.FIRST_COMPLETED
+            )
+            for task in done:
+                task.result()
+        except WebSocketDisconnect:
+            pass
+        except Exception as error:
+            # Provider exceptions can contain request bodies/headers: never echo or log them.
+            logger.warning("livekit_voice_failed", error_type=type(error).__name__)
+            with contextlib.suppress(WebSocketDisconnect, RuntimeError):
+                await websocket.send_json(
+                    {
+                        "type": "voice.error",
+                        "sessionId": session_id,
+                        "error": "LiveKit voice failed. Check provider credentials and connection.",
+                    }
+                )
+        finally:
+            if worker_failed.done() and not worker_failed.cancelled():
+                worker_failed.exception()
+            else:
+                worker_failed.cancel()
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            # A disconnected WebSocket can cancel the handler's scope. Shield
+            # bounded cleanup so provider connections do not survive that turn.
+            with CancelScope(shield=True):
+                if turn is not None:
+                    await asyncio.wait_for(turn.close(), timeout=10)
+                elif connection is not None:
+                    await connection.close()
 
     return app

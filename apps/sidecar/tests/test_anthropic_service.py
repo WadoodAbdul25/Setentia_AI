@@ -17,7 +17,11 @@ from claude_agent_sdk import (
     UserMessage,
 )
 from sentia_sidecar.anthropic_service import AnthropicRepositoryService, AnthropicServiceError
-from sentia_sidecar.repository import build_repository_manifest
+from sentia_sidecar.repository import (
+    MAX_CONTEXT_CHARS,
+    RepositoryManifest,
+    build_repository_manifest,
+)
 from sentia_sidecar.structural_index import StructuralIndex
 from structlog.testing import capture_logs
 
@@ -180,6 +184,68 @@ async def test_answer_uses_bounded_manifest_selection_and_content_read(tmp_path:
     assert validated["content_read_elapsed_ms"] >= 0
     assert validated["answer_elapsed_ms"] >= 0
     assert validated["total_elapsed_ms"] >= 0
+
+
+async def test_read_code_request_keeps_implementation_after_a_markdown_first_shortlist(
+    markdown_first_manifest: RepositoryManifest,
+) -> None:
+    manifest = markdown_first_manifest
+    documents = ["README.md", "PRODUCT_VISION_V2.md", "SESSIONS.md"]
+    code = [path for path in manifest.files if path.endswith(".py")]
+    calls: list[tuple[str, ClaudeAgentOptions]] = []
+
+    async def fake_query(*, prompt: str, options: ClaudeAgentOptions) -> AsyncIterator[object]:
+        calls.append((prompt, options))
+        if "FILE-SELECTION REPORT" not in prompt:
+            yield _result(
+                {
+                    "files": [
+                        {
+                            "path": path,
+                            "readMode": "full" if path in documents else "outline",
+                            "reason": "Selected evidence.",
+                        }
+                        for path in documents + code
+                    ],
+                    "rationale": "Read descriptions followed by implementation.",
+                }
+            )
+            return
+        for index in range(5):
+            assert f"return 'implemented feature {index}'" in prompt
+        assert "not a full repository audit" in prompt
+        assert isinstance(options.system_prompt, str)
+        assert "documentation alone" in options.system_prompt
+        assert "FILE-SELECTION REPORT is a plan" in options.system_prompt
+        yield _result(
+            {
+                "answer": "These features have implementation evidence; the vision is a plan.",
+                "spokenAnswer": "These features have code evidence. The vision is a plan.",
+                "evidence": [
+                    {"path": path, "startLine": 1, "endLine": 2, "label": "Implementation"}
+                    for path in code
+                ],
+                "recommendedMode": "brainstorm",
+                "modeReason": "The user asked to understand existing code.",
+            }
+        )
+
+    service = AnthropicRepositoryService(MODEL, query_function=fake_query)
+    await service.connect("sk-ant-test", validate=False)
+
+    with capture_logs() as logs:
+        answer = await service.answer(
+            "Read the code and tell me what features are present.", manifest
+        )
+
+    assert len(calls) == 2
+    assert answer.selected_files[:5] == code
+    assert answer.files_read == 8
+    assert {item.path for item in answer.evidence} == set(code)
+    reader = next(item for item in logs if item["event"] == "content_reader_completed")
+    assert reader["evidence_chars"] <= MAX_CONTEXT_CHARS
+    assert reader["omitted_files"] == []
+    assert set(reader["truncated_files"]) == set(documents + code)
 
 
 async def test_flow_root_selection_returns_auditable_investigation_without_ai_keywords(

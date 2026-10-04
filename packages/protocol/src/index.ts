@@ -99,6 +99,8 @@ export const voiceSessionStateSchema = z.enum([
   "connecting",
   "listening",
   "stopping",
+  "thinking",
+  "speaking",
   "closed",
   "error",
 ]);
@@ -254,6 +256,27 @@ export const repositoryAnswerSchema = z.object({
 });
 
 export type RepositoryAnswer = z.infer<typeof repositoryAnswerSchema>;
+
+// Sidecar/extension-only controls. PCM audio is sent in binary WebSocket frames,
+// never exposed to the webview; acknowledgments come from the native device.
+export const liveKitServerControlSchema = z.discriminatedUnion("type", [
+  z.object({
+    type: z.literal("voice.answer"),
+    sessionId: z.string().min(1),
+    requestId: z.string().min(1),
+    payload: repositoryAnswerSchema,
+  }),
+  z.object({
+    type: z.enum([
+      "voice.audio.start",
+      "voice.audio.flush",
+      "voice.audio.clear",
+    ]),
+    sessionId: z.string().min(1),
+    segmentId: z.string().min(1),
+  }),
+  z.object({ type: z.literal("voice.complete"), sessionId: z.string().min(1) }),
+]);
 
 export const flowEntityKindSchema = z.enum([
   "repository",
@@ -1077,6 +1100,7 @@ export const webviewToExtensionMessageSchema = z.discriminatedUnion("type", [
     type: z.literal("repository.ask"),
     question: z.string().trim().min(1).max(2_000),
     responseMode: z.enum(["text", "voice"]),
+    voiceSessionId: z.string().min(1).optional(),
   }),
   requestBase.extend({
     type: z.literal("voice.start"),
