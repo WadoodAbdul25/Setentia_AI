@@ -26,9 +26,11 @@ from sentia_sidecar.agent_runtime import (
     create_agent_router,
 )
 from sentia_sidecar.anchor_reconciliation import reconcile_anchors
+from sentia_sidecar.answer_stream import AnswerStreamEvent
 from sentia_sidecar.anthropic_service import AnthropicRepositoryService, AnthropicServiceError
 from sentia_sidecar.codex_service import CodexRepositoryService
 from sentia_sidecar.database import Database
+from sentia_sidecar.eot_model import EOTModel
 from sentia_sidecar.events import EventStore
 from sentia_sidecar.flow_graph import FlowTraversalPolicy, build_feature_flow
 from sentia_sidecar.logging_config import configure_logging
@@ -69,6 +71,7 @@ from sentia_sidecar.snapshot import (
     load_snapshot_project_paths,
 )
 from sentia_sidecar.structural_index import StructuralIndex
+from sentia_sidecar.turn_detection import LocalEOTScorer
 from sentia_sidecar.voice import (
     FLUX_EVENTS,
     DeepgramFluxGateway,
@@ -121,7 +124,14 @@ def create_app(
     agents = agent_router or create_agent_router()
     codex_login = codex_login_manager or CodexLoginManager()
     deepgram_voice_gateway = flux_gateway or DeepgramFluxGateway()
-    openai_transcription_gateway = openai_voice_gateway or OpenAIRealtimeTranscriptionGateway()
+    openai_transcription_gateway = openai_voice_gateway or OpenAIRealtimeTranscriptionGateway(
+        LocalEOTScorer(
+            lambda: EOTModel(
+                model_id=resolved.openai_eot_model_id,
+                max_input_tokens=resolved.openai_eot_max_input_tokens,
+            )
+        )
+    )
     deepgram_api_key: str | None = None
     openai_voice_api_key: str | None = (
         resolved.openai_api_key.get_secret_value() if resolved.openai_api_key else None
@@ -156,6 +166,8 @@ def create_app(
         try:
             yield
         finally:
+            if isinstance(openai_transcription_gateway, OpenAIRealtimeTranscriptionGateway):
+                openai_transcription_gateway.close()
             await snapshots.stop()
             await intelligence.close()
             await codex_login.close()
@@ -403,6 +415,62 @@ def create_app(
         )
         await events.publish("workflow.state", {"state": WorkflowState.READY})
         return answer
+
+    async def repository_answer_events(
+        body: RepositoryQuestion,
+    ) -> AsyncIterator[AnswerStreamEvent]:
+        await events.publish("workflow.state", {"state": WorkflowState.INDEXING})
+        try:
+            repository = await snapshots.manifest(body.workspace_path)
+            if repository is None:
+                paths = await asyncio.to_thread(load_snapshot_project_paths, body.workspace_path)
+                repository = await asyncio.to_thread(
+                    build_repository_manifest, body.workspace_path, paths
+                )
+            await events.publish(
+                "repository.indexed",
+                {
+                    "filesScanned": repository.files_scanned,
+                    "cacheSource": repository.cache_source,
+                },
+            )
+            await events.publish("workflow.state", {"state": WorkflowState.DISCUSSING})
+            async for event in intelligence.stream_answer(body.provider, body.question, repository):
+                if event.type == "complete" and event.answer is not None:
+                    await events.publish(
+                        "mode.recommended",
+                        {
+                            "mode": event.answer.recommended_mode,
+                            "reason": event.answer.mode_reason,
+                        },
+                    )
+                    await events.publish(
+                        "repository.answered",
+                        {
+                            "provider": body.provider,
+                            "evidenceCount": len(event.answer.evidence),
+                        },
+                    )
+                    await events.publish("workflow.state", {"state": WorkflowState.READY})
+                yield event
+        except Exception:
+            await events.publish("workflow.state", {"state": WorkflowState.FAILED})
+            raise
+
+    @app.post("/api/v1/repository/questions/stream", dependencies=auth_dependencies)
+    async def stream_repository_question(body: RepositoryQuestion) -> StreamingResponse:
+        async def stream() -> AsyncIterator[str]:
+            try:
+                async for event in repository_answer_events(body):
+                    yield f"data: {event.model_dump_json(by_alias=True)}\n\n"
+            except Exception:
+                logger.warning("repository_answer_stream_failed")
+                message = {"type": "error", "message": "Answer streaming failed. Please retry."}
+                yield f"data: {json.dumps(message)}\n\n"
+
+        return StreamingResponse(
+            stream(), media_type="text/event-stream", headers={"Cache-Control": "no-cache"}
+        )
 
     @app.post(
         "/api/v1/repository/flow-maps",
@@ -752,6 +820,10 @@ def create_app(
                     model=selected_model,
                     endpoint=selected_endpoint,
                     sample_rate=sample_rate or 24_000,
+                    semantic_eot_enabled=resolved.openai_eot_enabled,
+                    semantic_silence_ms=resolved.openai_eot_min_silence_ms,
+                    eot_threshold=resolved.openai_eot_threshold,
+                    eot_inference_timeout_ms=resolved.openai_eot_inference_timeout_ms,
                 )
                 active_connection = await openai_transcription_gateway.connect(
                     selected_api_key, openai_options, keyterms
@@ -944,7 +1016,15 @@ def create_app(
             vocabulary = build_vocabulary(repository, active_file)
             connection = await openai_transcription_gateway.connect(
                 openai_voice_api_key,
-                OpenAIVoiceOptions(model=model, endpoint=endpoint, sample_rate=24_000),
+                OpenAIVoiceOptions(
+                    model=model,
+                    endpoint=endpoint,
+                    sample_rate=24_000,
+                    semantic_eot_enabled=resolved.openai_eot_enabled,
+                    semantic_silence_ms=resolved.openai_eot_min_silence_ms,
+                    eot_threshold=resolved.openai_eot_threshold,
+                    eot_inference_timeout_ms=resolved.openai_eot_inference_timeout_ms,
+                ),
                 select_keyterms(vocabulary),
             )
 
@@ -956,6 +1036,17 @@ def create_app(
                         provider=AgentProvider(provider),
                     )
                 )
+
+            async def analyze_stream(
+                question: str, provider: str
+            ) -> AsyncIterator[AnswerStreamEvent]:
+                body = RepositoryQuestion(
+                    workspace_path=workspace_path,
+                    question=question,
+                    provider=AgentProvider(provider),
+                )
+                async for event in repository_answer_events(body):
+                    yield event
 
             turn = factory(
                 session_id=session_id,
@@ -969,6 +1060,8 @@ def create_app(
                 tts_voice=tts_voice,
                 tts_url=tts_endpoint.rstrip("/") + "/v1",
                 analyze=analyze,
+                analyze_stream=analyze_stream,
+                progress_phrases=resolved.voice_progress_phrases,
             )
 
             async def write_output() -> None:

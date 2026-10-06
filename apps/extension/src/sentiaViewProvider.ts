@@ -15,6 +15,7 @@ import {
   type DeepgramStatus,
   type EvidenceRange,
   type OpenAIVoiceStatus,
+  type RepositoryAnswerStreamEvent,
   type SidecarStatus,
   type VoiceProvider,
   type VoiceServerMessage,
@@ -549,6 +550,28 @@ export class SentiaViewProvider implements vscode.WebviewViewProvider {
               "Choose Claude Code or Codex before asking Sentia.",
             );
           }
+          const onUpdate = (event: RepositoryAnswerStreamEvent): void => {
+            if (event.type === "activity") {
+              this.post({
+                type: "repository.answer.activity",
+                requestId: message.requestId,
+                activity: event.activity,
+              });
+            } else if (event.type === "delta") {
+              this.post({
+                type: "repository.answer.delta",
+                requestId: message.requestId,
+                delta: event.text,
+              });
+            } else if (event.type === "progress") {
+              this.post({
+                type: "repository.answer.progress",
+                requestId: message.requestId,
+                stage: event.stage,
+                message: event.text,
+              });
+            }
+          };
           const flowMapQuestion = explicitFlowMapQuestion(message.question);
           if (flowMapQuestion) {
             this.runtime.cancelLiveKitVoice();
@@ -574,6 +597,7 @@ export class SentiaViewProvider implements vscode.WebviewViewProvider {
               message.question,
               provider,
               folder.uri.fsPath,
+              onUpdate,
             );
             this.post({
               type: "repository.answer",
@@ -586,6 +610,7 @@ export class SentiaViewProvider implements vscode.WebviewViewProvider {
             folder.uri.fsPath,
             message.question,
             provider,
+            onUpdate,
           );
           this.post({
             type: "repository.answer",

@@ -5,12 +5,36 @@ microphone and intelligent interruption remain proposed.
 
 ## Implemented first phase
 
+Written Q&A now streams through `/api/v1/repository/questions/stream`, and the
+LiveKit socket forwards request-scoped `voice.answer.delta` and
+`voice.answer.progress` events. SDK streams expose only the structured `answer`
+field, never reasoning or raw JSON metadata. The UI marks it as a draft until the
+final answer replaces it. Complete Markdown passages with valid source ranges
+may enter Cerebras narration while repository generation continues; uncited or
+unfinished passages are held until full-answer validation. This range check is
+not independent semantic fact verification.
+
+One speech worker serializes short stage phrases and answer passages, waiting
+for native playback acknowledgments between segments. Progress phrases are fixed
+application text (not model-invented status), capped at two with a 12-second
+cooldown, and tied to actual work stages. They can be disabled with
+`SENTIA_VOICE_PROGRESS_PHRASES=false`. A speech failure does not stop the written
+answer stream. The old 60-second audio cap and overall 90-second speech deadline
+are removed; provider connection timeouts remain in force.
+
 The selected scope is OpenAI STT + Cerebras narration + OpenAI TTS, orchestrated
 by one local LiveKit `AgentSession` per recorded question. `LiveTranscriptionSTT`
 adapts the existing `gpt-live-transcribe` transport without changing its model.
-The microphone still stops on Send/end-of-turn. The existing five-second silence
-commit and two-second submission grace remain; they are not the proposed unified
-continuous turn detector.
+The microphone still stops on Send/end-of-turn. Both OpenAI paths now use the
+local SmolLM2 completion scorer: stable text can finish after 600 ms of acoustic
+silence; uncertain, unavailable, or slow scoring falls back to the 1.5-second
+silence deadline. Late transcript updates do not restart that deadline. Inference
+runs off the audio event loop; resumed speech invalidates stale decisions.
+Per-connection context and turn resets survive a normal final transcript without
+closing the provider socket, preparing the transport for continuous capture.
+The UI and LiveKit turn wrapper are still one-shot; this is not the full proposed
+continuous turn coordinator or interruption gate. LiveKit's implicit VAD is
+disabled in this manual-turn path to avoid a competing endpoint controller.
 
 `/api/v1/voice/livekit/session` transfers native PCM, transcript events, an
 accepted question, the validated repository answer, and synthesized audio over
@@ -20,7 +44,8 @@ one authenticated loopback connection. Repository work reuses `ask_repository()`
 acknowledges output completion; synthesis completion alone does not.
 
 `sentia.voice.openaiPipeline=livekit` selects this path (default on this branch);
-`native` selects the original OpenAI path. Deepgram is unchanged. Keys are read
+`native` selects the original OpenAI path with the same silence timing. Deepgram
+retains Flux turn detection with a 1.5-second silence timeout. Keys are read
 locally from `apps/sidecar/.env` on development startup. See
 [OpenAI setup](../README.md#openai-voice-setup). The Deepgram initial-stack choice
 and persistent/interruption sections below remain later-phase proposals, not

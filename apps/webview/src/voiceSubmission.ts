@@ -1,6 +1,7 @@
 import type { VoiceProvider } from "@sentia/protocol";
 
-export const VOICE_AUTO_SUBMIT_DELAY_MS = 2_000;
+// The turn detector has already waited for silence; do not add another grace period.
+export const VOICE_AUTO_SUBMIT_DELAY_MS = 0;
 
 export type VoiceTurnAction = "ignore" | "queue" | "submit";
 

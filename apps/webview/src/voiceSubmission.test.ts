@@ -1,8 +1,15 @@
 import { describe, expect, it } from "vitest";
 
-import { resolveVoiceTurnAction } from "./voiceSubmission";
+import {
+  resolveVoiceTurnAction,
+  VOICE_AUTO_SUBMIT_DELAY_MS,
+} from "./voiceSubmission";
 
 describe("voice turn submission policy", () => {
+  it("does not add a delay after the turn detector finishes", () => {
+    expect(VOICE_AUTO_SUBMIT_DELAY_MS).toBe(0);
+  });
+
   it("queues a completed Deepgram turn for automatic voice submission", () => {
     expect(
       resolveVoiceTurnAction({

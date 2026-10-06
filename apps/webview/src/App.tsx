@@ -19,7 +19,12 @@ import {
   StateJourney,
   type ModePreference,
 } from "./StateJourney";
-import { MarkdownAnswer } from "./MarkdownAnswer";
+import {
+  activityMarkdown,
+  AnswerViewToggle,
+  RepositoryAnswerBody,
+  type AnswerView,
+} from "./RepositoryAnswerBody";
 import { useSentiaStore } from "./store";
 import {
   VOICE_AUTO_SUBMIT_DELAY_MS,
@@ -40,6 +45,7 @@ export function App({ bridge }: AppProps) {
   const [modePreference, setModePreference] = useState<ModePreference>("auto");
   const [question, setQuestion] = useState("What is this codebase about?");
   const [activeRequestId, setActiveRequestId] = useState<string | null>(null);
+  const [answerView, setAnswerView] = useState<AnswerView>("markdown");
   const [voiceSessionId, setVoiceSessionId] = useState<string | null>(null);
   const [voiceSubmitRequested, setVoiceSubmitRequested] = useState(false);
   const [pendingVoiceSubmission, setPendingVoiceSubmission] =
@@ -53,6 +59,7 @@ export function App({ bridge }: AppProps) {
     extensionVersion,
     flowMapOpened,
     repositoryAnswer,
+    repositoryDraft,
     requestError,
     sidecar,
     workspaceName,
@@ -74,6 +81,8 @@ export function App({ bridge }: AppProps) {
       : null;
   const error =
     requestError?.requestId === activeRequestId ? requestError.error : null;
+  const draft =
+    repositoryDraft?.requestId === activeRequestId ? repositoryDraft : null;
   const mapOpened =
     flowMapOpened?.requestId === activeRequestId ? flowMapOpened : null;
   const asking =
@@ -153,6 +162,7 @@ export function App({ bridge }: AppProps) {
       }
       const requestId = crypto.randomUUID();
       setActiveRequestId(requestId);
+      useSentiaStore.getState().beginRepositoryRequest(requestId);
       bridge.post({
         type: "repository.ask",
         requestId,
@@ -547,7 +557,7 @@ export function App({ bridge }: AppProps) {
                   }
                   title={
                     pendingVoiceSubmission
-                      ? "Submit the detected Deepgram turn now"
+                      ? "Submit the detected voice turn now"
                       : voiceSessionId
                         ? "Stop listening and ask Sentia"
                         : voiceConnected
@@ -596,7 +606,7 @@ export function App({ bridge }: AppProps) {
             </button>
             {pendingVoiceSubmission ? (
               <p className="voice-status" aria-live="polite">
-                End of turn detected. Sending in two seconds—Cancel to discard.
+                End of turn detected. Sending…
               </p>
             ) : voiceStatus?.state === "thinking" ||
               voiceStatus?.state === "speaking" ? (
@@ -655,6 +665,31 @@ export function App({ bridge }: AppProps) {
             </section>
           ) : null}
 
+          {!answer && draft ? (
+            <section
+              className="answer-card"
+              aria-live="polite"
+              aria-busy={!draft.failed}
+            >
+              <div className="answer-card__heading">
+                <h2>
+                  {draft.failed
+                    ? "Work stopped"
+                    : `${providerName} is working…`}
+                </h2>
+                <span>Live work log · replaced by the final answer</span>
+              </div>
+              <AnswerViewToggle view={answerView} onChange={setAnswerView} />
+              <RepositoryAnswerBody
+                view={answerView}
+                content={activityMarkdown(
+                  draft.activities,
+                  draft.message,
+                  draft.failed,
+                )}
+              />
+            </section>
+          ) : null}
           {answer ? (
             <section className="answer-card" aria-live="polite">
               <div className="answer-card__heading">
@@ -663,7 +698,9 @@ export function App({ bridge }: AppProps) {
                   {answer.filesRead} of {answer.filesScanned} files read
                 </span>
               </div>
-              <MarkdownAnswer
+              <AnswerViewToggle view={answerView} onChange={setAnswerView} />
+              <RepositoryAnswerBody
+                view={answerView}
                 content={answer.answer}
                 evidence={answer.evidence}
                 onOpenEvidence={openEvidence}

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 from collections.abc import AsyncIterator, Callable
 from pathlib import Path
@@ -21,6 +22,7 @@ from claude_agent_sdk import (
     ClaudeAgentOptions,
     ResultMessage,
     StreamEvent,
+    SystemMessage,
     ToolResultBlock,
     ToolUseBlock,
     UserMessage,
@@ -29,6 +31,18 @@ from claude_agent_sdk import (
 from pydantic import BaseModel, ValidationError
 from structlog.typing import FilteringBoundLogger
 
+from sentia_sidecar.answer_stream import (
+    AnswerEventCallback,
+    AnswerStreamAccumulator,
+    AnswerStreamEvent,
+    SDKActivityReporter,
+    TextSnapshotCallback,
+    emit_activity,
+    emit_progress,
+    emit_read_activity,
+    emit_selection_activity,
+    stream_answer_task,
+)
 from sentia_sidecar.feature_trace import (
     TRACE_SYSTEM_PROMPT,
     FeatureTraceEngine,
@@ -126,6 +140,8 @@ class AnthropicRepositoryService:
         self,
         question: str,
         manifest: RepositoryManifest,
+        *,
+        on_event: AnswerEventCallback | None = None,
     ) -> RepositoryAnswer:
         if self._api_key is None:
             raise AnthropicServiceError("Connect an Anthropic API key before asking Sentia.", 409)
@@ -143,6 +159,14 @@ class AnthropicRepositoryService:
         )
 
         try:
+            await emit_activity(
+                on_event,
+                "repository",
+                f"Using the repository index of {manifest.files_scanned} files "
+                "to find relevant evidence.",
+                status="completed",
+            )
+            await emit_progress(on_event, "file_selection")
             selection_started = time.perf_counter()
             selection_result = await self._run_structured_turn(
                 prompt=(
@@ -156,6 +180,7 @@ class AnthropicRepositoryService:
                 workspace_path=manifest.root,
                 diagnostic_id=diagnostic_id,
                 stage=stage,
+                activity=SDKActivityReporter(on_event, "Claude", stage) if on_event else None,
             )
             selection = FileSelection.model_validate(selection_result.structured_output)
             selection_elapsed_ms = _elapsed_ms(selection_started)
@@ -177,7 +202,10 @@ class AnthropicRepositoryService:
                 runtime="claude_agent_sdk",
             )
 
+            await emit_selection_activity(on_event, requested)
+
             stage = "content_read"
+            await emit_progress(on_event, stage)
             read_started = time.perf_counter()
             try:
                 async with asyncio.timeout(CONTENT_RETRIEVAL_TIMEOUT_SECONDS):
@@ -203,6 +231,7 @@ class AnthropicRepositoryService:
                 elapsed_ms=content_read_elapsed_ms,
                 timeout_seconds=CONTENT_RETRIEVAL_TIMEOUT_SECONDS,
             )
+            await emit_read_activity(on_event, repository)
 
             selection_report = "\n".join(
                 f"- {choice.path} ({choice.read_mode}): {choice.reason}"
@@ -210,6 +239,8 @@ class AnthropicRepositoryService:
                 if choice.path in manifest.files
             )
             stage = "repository_answer"
+            await emit_progress(on_event, stage)
+            accumulator = AnswerStreamAccumulator(repository, on_event) if on_event else None
             answer_started = time.perf_counter()
             answer_result = await self._run_structured_turn(
                 prompt=(
@@ -229,6 +260,8 @@ class AnthropicRepositoryService:
                 workspace_path=manifest.root,
                 diagnostic_id=diagnostic_id,
                 stage=stage,
+                on_snapshot=accumulator.update if accumulator else None,
+                activity=SDKActivityReporter(on_event, "Claude", stage) if on_event else None,
             )
             draft = ModelAnswer.model_validate(answer_result.structured_output)
             answer_elapsed_ms = _elapsed_ms(answer_started)
@@ -253,6 +286,7 @@ class AnthropicRepositoryService:
                 stage=stage,
             ) from error
 
+        await emit_progress(on_event, "validation")
         evidence = validate_evidence(draft.evidence, repository)
         answer_text = draft.answer.strip()
         if not answer_text:
@@ -296,7 +330,23 @@ class AnthropicRepositoryService:
             cost_usd=(selection_result.total_cost_usd or 0) + (answer_result.total_cost_usd or 0),
             runtime="claude_agent_sdk",
         )
+        if accumulator is not None:
+            await accumulator.finish(result)
+        await emit_activity(
+            on_event,
+            "validation",
+            "Answer ready. Checked the file references against the supplied evidence.",
+            status="completed",
+        )
         return result
+
+    async def stream_answer(
+        self, question: str, manifest: RepositoryManifest
+    ) -> AsyncIterator[AnswerStreamEvent]:
+        async for event in stream_answer_task(
+            lambda emit: self.answer(question, manifest, on_event=emit)
+        ):
+            yield event
 
     async def trace_feature(
         self, question: str, manifest: RepositoryManifest, index: StructuralIndex
@@ -472,6 +522,8 @@ class AnthropicRepositoryService:
         workspace_path: Path,
         diagnostic_id: str,
         stage: str,
+        on_snapshot: TextSnapshotCallback | None = None,
+        activity: SDKActivityReporter | None = None,
     ) -> ResultMessage:
         if self._api_key is None:
             raise AnthropicServiceError("Connect an Anthropic API key before asking Sentia.", 409)
@@ -500,6 +552,7 @@ class AnthropicRepositoryService:
             model=self.model,
             setting_sources=[],
             output_format={"type": "json_schema", "schema": response_schema},
+            include_partial_messages=on_snapshot is not None or activity is not None,
         )
         is_trace = stage.startswith("feature_trace_")
         if is_trace:
@@ -526,8 +579,52 @@ class AnthropicRepositoryService:
         usage_snapshots: dict[str, dict[str, int]] = {}
         structured_tool_ids: set[str] = set()
         rejected_tool_ids: set[str] = set()
+        streamed_blocks: dict[int, str] = {}
         try:
             async for message in self._query(prompt=prompt, options=options):
+                if activity is not None:
+                    if isinstance(message, SystemMessage) and message.subtype == "init":
+                        await activity.report("started")
+                    elif isinstance(message, StreamEvent):
+                        event_type = message.event.get("type")
+                        if event_type == "message_start":
+                            await activity.report("generating")
+                        elif event_type == "content_block_start":
+                            content_block = message.event.get("content_block", {})
+                            if (
+                                isinstance(content_block, dict)
+                                and content_block.get("name") == "StructuredOutput"
+                            ):
+                                await activity.report("formatting")
+                    elif isinstance(message, AssistantMessage):
+                        await activity.report("generating")
+                if on_snapshot is not None:
+                    if isinstance(message, StreamEvent):
+                        event = message.event
+                        index = event.get("index", 0)
+                        block = event.get("content_block", {})
+                        if (
+                            event.get("type") == "content_block_start"
+                            and isinstance(index, int)
+                            and isinstance(block, dict)
+                            and block.get("name") == "StructuredOutput"
+                        ):
+                            streamed_blocks[index] = ""
+                        delta = event.get("delta", {})
+                        if (
+                            event.get("type") == "content_block_delta"
+                            and isinstance(index, int)
+                            and index in streamed_blocks
+                            and isinstance(delta, dict)
+                            and delta.get("type") == "input_json_delta"
+                            and isinstance(delta.get("partial_json"), str)
+                        ):
+                            streamed_blocks[index] += delta["partial_json"]
+                            await on_snapshot(streamed_blocks[index])
+                    elif isinstance(message, AssistantMessage):
+                        for block in message.content:
+                            if isinstance(block, ToolUseBlock) and block.name == "StructuredOutput":
+                                await on_snapshot(json.dumps(block.input))
                 if is_trace and isinstance(message, AssistantMessage):
                     structured_tool_ids.update(
                         block.id
@@ -537,7 +634,10 @@ class AnthropicRepositoryService:
                     # The CLI emits separate content blocks with the same message ID
                     # and provisional usage. Suppress repeats, but retain revised usage.
                     values = _usage_counts(message.usage or {})
-                    if message.message_id is None or usage_snapshots.get(message.message_id) != values:
+                    if (
+                        message.message_id is None
+                        or usage_snapshots.get(message.message_id) != values
+                    ):
                         if message.message_id is not None:
                             usage_snapshots[message.message_id] = values
                         logger.info(
@@ -550,7 +650,11 @@ class AnthropicRepositoryService:
                             usage_kind="snapshot",
                             **values,
                         )
-                if is_trace and isinstance(message, UserMessage) and isinstance(message.content, list):
+                if (
+                    is_trace
+                    and isinstance(message, UserMessage)
+                    and isinstance(message.content, list)
+                ):
                     for block in message.content:
                         if (
                             isinstance(block, ToolResultBlock)
@@ -598,6 +702,10 @@ class AnthropicRepositoryService:
                 f"{stage.replace('_', ' ')}. Diagnostic ID: {diagnostic_id}.",
                 502,
             )
+        if on_snapshot is not None:
+            await on_snapshot(json.dumps(result_message.structured_output))
+        if activity is not None:
+            await activity.report("finished")
         return result_message
 
     async def render_speech(

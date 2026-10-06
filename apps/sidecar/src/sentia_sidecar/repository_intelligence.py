@@ -6,6 +6,7 @@ from typing import Protocol, runtime_checkable
 
 from pydantic import ConfigDict, Field
 
+from sentia_sidecar.answer_stream import AnswerStreamEvent
 from sentia_sidecar.feature_trace import FeatureTraceResult, FeatureTraceService
 from sentia_sidecar.flow_investigation import (
     FlowRootSelectionResult,
@@ -150,6 +151,13 @@ class StreamingSpeechRenderer(Protocol):
 
 
 @runtime_checkable
+class StreamingRepositoryAnswerer(Protocol):
+    def stream_answer(
+        self, question: str, manifest: RepositoryManifest
+    ) -> AsyncIterator[AnswerStreamEvent]: ...
+
+
+@runtime_checkable
 class ClosableRepositoryIntelligenceService(Protocol):
     async def close(self) -> None: ...
 
@@ -190,6 +198,18 @@ class RepositoryIntelligenceRouter:
                 400,
             )
         return await service.select_flow_roots(question, manifest, index)
+
+    async def stream_answer(
+        self, provider: AgentProvider, question: str, manifest: RepositoryManifest
+    ) -> AsyncIterator[AnswerStreamEvent]:
+        service = self.service(provider)
+        if isinstance(service, StreamingRepositoryAnswerer):
+            async for event in service.stream_answer(question, manifest):
+                yield event
+            return
+        result = await service.answer(question, manifest)
+        yield AnswerStreamEvent(type="delta", text=result.answer)
+        yield AnswerStreamEvent(type="complete", answer=result)
 
     async def trace_feature(
         self,

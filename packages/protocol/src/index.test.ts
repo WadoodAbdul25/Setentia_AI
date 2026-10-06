@@ -12,6 +12,7 @@ import {
   flowRootSelectionSchema,
   healthResponseSchema,
   liveKitServerControlSchema,
+  repositoryAnswerStreamEventSchema,
   projectSnapshotStatusSchema,
   repositoryInvestigationSchema,
   sentiaFlowGraphSchema,
@@ -78,6 +79,34 @@ describe("Sentia protocol", () => {
       responseMode: "text",
     });
     expect(message.type).toBe("repository.ask");
+  });
+
+  it("carries English work-log entries through HTTP, LiveKit, and the webview", () => {
+    const activity = {
+      id: "content_read",
+      stage: "content_read",
+      status: "completed",
+      message: "Read evidence from 8 files.",
+      details: ["src/main.py", "5 files were shortened."],
+    };
+    expect(
+      repositoryAnswerStreamEventSchema.parse({ type: "activity", activity }),
+    ).toMatchObject({ activity });
+    expect(
+      liveKitServerControlSchema.parse({
+        type: "voice.answer.activity",
+        requestId: "q-1",
+        sessionId: "voice-1",
+        activity,
+      }),
+    ).toMatchObject({ activity });
+    expect(
+      extensionToWebviewMessageSchema.parse({
+        type: "repository.answer.activity",
+        requestId: "q-1",
+        activity,
+      }),
+    ).toMatchObject({ activity });
   });
 
   it("accepts Flux audio and corrected transcript messages", () => {

@@ -579,6 +579,37 @@ button {
   overflow-wrap: anywhere;
 }
 
+.answer-view-toggle {
+  display: flex;
+  gap: 6px;
+}
+
+.answer-view-toggle button {
+  background: transparent;
+  border: 1px solid var(--vscode-widget-border);
+  border-radius: 4px;
+  color: var(--vscode-descriptionForeground);
+  cursor: pointer;
+  font-size: 11px;
+  padding: 3px 8px;
+}
+
+.answer-view-toggle button[aria-pressed="true"] {
+  background: var(--vscode-button-secondaryBackground);
+  color: var(--vscode-button-secondaryForeground);
+}
+
+.answer-copy--tiptap .tiptap {
+  outline: none;
+}
+
+.answer-copy--tiptap pre {
+  background: var(--vscode-textCodeBlock-background);
+  border-radius: 4px;
+  overflow-x: auto;
+  padding: 10px;
+}
+
 .answer-copy > :first-child {
   margin-top: 0 !important;
 }

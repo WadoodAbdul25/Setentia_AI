@@ -12,6 +12,7 @@ from fastapi.testclient import TestClient
 from livekit import rtc
 from livekit.agents import DEFAULT_API_CONNECT_OPTIONS, llm, stt, tts
 from pydantic import SecretStr
+from sentia_sidecar.answer_stream import AnswerActivity, AnswerStreamEvent
 from sentia_sidecar.app import create_app
 from sentia_sidecar.livekit_voice import (
     DesktopAudioInput,
@@ -24,7 +25,7 @@ from sentia_sidecar.livekit_voice import (
 from sentia_sidecar.protocol import AgentProvider, RepositoryAnswer, TokenUsage, WorkingMode
 from sentia_sidecar.repository_intelligence import RepositoryIntelligenceRouter
 from sentia_sidecar.settings import Settings
-from sentia_sidecar.voice import RepositoryTranscriptCorrector, VoiceError
+from sentia_sidecar.voice import OpenAIVoiceOptions, RepositoryTranscriptCorrector, VoiceError
 from starlette.websockets import WebSocketDisconnect
 
 
@@ -260,13 +261,155 @@ async def test_real_session_runs_grounded_pipeline_and_waits_for_device(
     assert connection.closed
 
 
+async def test_checked_passage_speaks_before_repository_generation_finishes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("sentia_sidecar.livekit_voice.openai.LLM", FakeLLM)
+    monkeypatch.setattr("sentia_sidecar.livekit_voice.openai.TTS", FakeTTS)
+    release_final = asyncio.Event()
+    first = "Sentia reads repository evidence."
+    second = "It shows the supported answer."
+
+    async def analyze(question: str, provider: str) -> RepositoryAnswer:
+        raise AssertionError("The non-streaming analysis path must not be used")
+
+    async def analyze_stream(question: str, provider: str) -> Any:
+        yield AnswerStreamEvent(
+            type="progress", stage="file_selection", text="Searching the files."
+        )
+        yield AnswerStreamEvent(
+            type="activity",
+            activity=AnswerActivity(
+                id="content_read",
+                stage="content_read",
+                status="completed",
+                message="Read evidence from 1 file.",
+                details=["main.py"],
+            ),
+        )
+        yield AnswerStreamEvent(type="delta", text=first)
+        yield AnswerStreamEvent(type="passage", text=first)
+        await release_final.wait()
+        yield AnswerStreamEvent(type="delta", text="\n\n" + second)
+        yield AnswerStreamEvent(type="passage", text=second)
+        yield AnswerStreamEvent(type="complete", answer=grounded_answer())
+
+    turn = LiveKitVoiceTurn(
+        session_id="stream-session",
+        connection=FakeConnection(),
+        corrector=RepositoryTranscriptCorrector(()),
+        openai_key="fixture",
+        cerebras_key="fixture",
+        cerebras_url="https://api.cerebras.ai/v1",
+        cerebras_model="gpt-oss-120b",
+        tts_model="gpt-4o-mini-tts",
+        tts_voice="marin",
+        tts_url="https://api.openai.com/v1",
+        analyze=analyze,
+        analyze_stream=analyze_stream,
+        progress_phrases=False,
+    )
+    task: asyncio.Task[None] | None = None
+    seen: list[Any] = []
+    try:
+        await turn.start()
+        await turn.finish_recording()
+        task = asyncio.create_task(turn.answer("stream-request", "Explain", "codex"))
+        while True:
+            event = await asyncio.wait_for(turn.outgoing.get(), 5)
+            seen.append(event)
+            if isinstance(event, dict) and event["type"] == "voice.audio.flush":
+                if not release_final.is_set():
+                    assert not any(
+                        isinstance(x, dict) and x["type"] == "voice.answer" for x in seen
+                    )
+                    assert any(isinstance(x, bytes) for x in seen)
+                    assert not task.done()
+                    release_final.set()
+                turn.audio_output.acknowledge(event["segmentId"])
+            if isinstance(event, dict) and event["type"] == "voice.complete":
+                break
+        await task
+        assert any(
+            isinstance(event, dict)
+            and event.get("type") == "voice.answer.activity"
+            and event["requestId"] == "stream-request"
+            and event["activity"]["details"] == ["main.py"]
+            for event in seen
+        )
+        narrator = turn.narrator
+        assert isinstance(narrator, FakeLLM)
+        assert [
+            json.loads(context.items[-1].text_content)["answer"] for context in narrator.contexts
+        ] == [first, second]
+    finally:
+        release_final.set()
+        if task is not None:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        await turn.close()
+
+
+async def test_progress_speech_failure_does_not_abort_written_answer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("sentia_sidecar.livekit_voice.openai.LLM", FakeLLM)
+    monkeypatch.setattr("sentia_sidecar.livekit_voice.openai.TTS", FakeTTS)
+
+    async def analyze(question: str, provider: str) -> RepositoryAnswer:
+        return grounded_answer()
+
+    async def analyze_stream(question: str, provider: str) -> Any:
+        yield AnswerStreamEvent(
+            type="progress", stage="file_selection", text="Searching the files."
+        )
+        await asyncio.sleep(0.05)
+        yield AnswerStreamEvent(type="delta", text=grounded_answer().answer)
+        yield AnswerStreamEvent(type="complete", answer=grounded_answer())
+
+    turn = LiveKitVoiceTurn(
+        session_id="failed-progress",
+        connection=FakeConnection(),
+        corrector=RepositoryTranscriptCorrector(()),
+        openai_key="fixture",
+        cerebras_key="fixture",
+        cerebras_url="https://api.cerebras.ai/v1",
+        cerebras_model="gpt-oss-120b",
+        tts_model="gpt-4o-mini-tts",
+        tts_voice="marin",
+        tts_url="https://api.openai.com/v1",
+        analyze=analyze,
+        analyze_stream=analyze_stream,
+    )
+
+    def fail_speech(*args: Any, **kwargs: Any) -> Any:
+        raise RuntimeError("TTS unavailable")
+
+    monkeypatch.setattr(turn.session, "say", fail_speech)
+    try:
+        await turn.start()
+        await turn.finish_recording()
+        await asyncio.wait_for(turn.answer("request", "Explain", "codex"), 3)
+        seen = []
+        while not turn.outgoing.empty():
+            seen.append(turn.outgoing.get_nowait())
+        assert turn.speech_failed
+        assert any(isinstance(x, dict) and x["type"] == "voice.answer" for x in seen)
+        assert any(isinstance(x, dict) and x["type"] == "voice.complete" for x in seen)
+        assert not any(isinstance(x, dict) and x["type"] == "voice.error" for x in seen)
+    finally:
+        await turn.close()
+
+
 class FakeGateway:
     def __init__(self) -> None:
         self.connection = FakeConnection()
         self.calls = 0
+        self.options: OpenAIVoiceOptions | None = None
 
     async def connect(self, *args: Any) -> FakeConnection:
         self.calls += 1
+        self.options = args[1]
         return self.connection
 
 
@@ -279,6 +422,9 @@ def test_cancel_closes_session_without_analysis(
         update={
             "openai_api_key": SecretStr("test-openai-key"),
             "cerebras_api_key": SecretStr("test-cerebras-key"),
+            "openai_eot_threshold": 0.08,
+            "openai_eot_min_silence_ms": 750,
+            "openai_eot_inference_timeout_ms": 250,
         }
     )
     gateway = FakeGateway()
@@ -297,6 +443,10 @@ def test_cancel_closes_session_without_analysis(
         assert socket.receive_json()["state"] == "listening"
         socket.send_json({"type": "voice.cancel"})
     assert gateway.connection.closed
+    assert gateway.options is not None
+    assert gateway.options.eot_threshold == 0.08
+    assert gateway.options.semantic_silence_ms == 750
+    assert gateway.options.eot_inference_timeout_ms == 250
 
 
 class FakeAnalysis:
@@ -380,7 +530,7 @@ def test_websocket_runs_analysis_narration_and_device_ack(
         while True:
             message = socket.receive()
             if isinstance(message.get("bytes"), bytes):
-                assert answered
+                # Stage speech can now play before the repository answer is complete.
                 audio_bytes += len(message["bytes"])
                 continue
             payload = json.loads(message["text"])
@@ -393,6 +543,7 @@ def test_websocket_runs_analysis_narration_and_device_ack(
                     {"type": "voice.playback_finished", "segmentId": payload["segmentId"]}
                 )
             elif payload["type"] == "voice.complete":
+                assert answered
                 break
             assert payload["type"] != "voice.error"
         assert audio_bytes > 0

@@ -43,7 +43,7 @@ Connecting, recovering, muted, and idle are additional lifecycle conditions.
 | `App.startVoice()` starts one recording. Its transcript effect sends `voice.stop`, and `submitVoiceTurn()` clears the session.         | Separate conversation lifetime from individual user turns.                                                |
 | `SidecarRuntime.startVoice()` opens a provider-specific local WebSocket.                                                               | Keep the connection alive across turns and distinguish connection failure from turn completion.           |
 | `transcribe_voice()` forwards provider results and closes the stream after Stop.                                                       | Add a persistent session route with explicit finish-turn, discard-turn, and end-session commands.         |
-| `OpenAIRealtimeTranscriptionConnection` uses an RMS threshold and five seconds of silence. Its finish flags assume one completed turn. | Replace this with speech detection, completion scoring, and independent records for every committed item. |
+| `OpenAIRealtimeTranscriptionConnection` combines RMS activity, local SmolLM2 scoring after 600 ms, and a 1.5-second silence fallback. Turn context resets without closing the socket; finals are matched by item ID. | Replace RMS with learned VAD; add the persistent coordinator, echo handling, and multi-item utterance merging. |
 | `NativeSpeaker` offers start, write, finish, and stop.                                                                                 | Add playback pause, resume, progress, and actual device completion events.                                |
 | Microphone and speaker run in separate native helpers.                                                                                 | Use one native audio engine for simultaneous input/output and echo processing.                            |
 | Repository questions carry only workspace, question, and provider.                                                                     | Add bounded conversation context so follow-ups can refer to earlier answers.                              |
@@ -143,6 +143,22 @@ ending the connection. Flux documents these controls and provisional events in
 its [agent guide](https://developers.deepgram.com/docs/flux/agent).
 
 ### OpenAI adapter
+
+Implemented groundwork: `sentia_sidecar/eot_model.py` contains the packaged
+SmolLM2 scorer; `turn_detection.py` owns a shared background model worker and
+per-connection `OpenAITurnDetector` context. The transport checks 150 ms of text
+stability after a 600 ms acoustic pause, limits inference to 350 ms and the
+remaining 1.5-second silence deadline, and rejects results whose turn generation
+or revision changed. `StartOfTurn`, `EagerEndOfTurn`, and `TurnResumed` describe
+local candidates; only a provider final produces `EndOfTurn`. Committed item IDs
+retain their completion score, duplicate finals are ignored, and speech arriving
+while the previous final is pending remains tracked for the next turn.
+`add_assistant_context()` supplies answer history for a future persistent
+coordinator; `finish_turn()` commits explicitly without ending the connection.
+Stop remains an explicit stream-ending action, not a normal turn reset.
+The model is general instruction-tuned SmolLM2, so its 0.03 threshold remains a
+starting value requiring evaluation; learned VAD and the full persistent state
+machine below are not yet implemented.
 
 Retain `gpt-live-transcribe`. It requires application-controlled audio commits;
 it cannot enable `server_vad` or `semantic_vad`. Use a transcription-only session

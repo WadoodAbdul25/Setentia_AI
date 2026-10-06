@@ -17,6 +17,7 @@ import {
   projectSnapshotStatusSchema,
   PROTOCOL_VERSION,
   repositoryAnswerSchema,
+  repositoryAnswerStreamEventSchema,
   spokenAnswerSchema,
   voiceServerMessageSchema,
   liveKitServerControlSchema,
@@ -30,6 +31,7 @@ import {
   type FlowMapResponse,
   type ProjectSnapshotStatus,
   type RepositoryAnswer,
+  type RepositoryAnswerStreamEvent,
   type SpokenAnswer,
   type SidecarStatus,
   type OpenAIVoiceStatus,
@@ -89,6 +91,7 @@ export class SidecarRuntime implements vscode.Disposable {
         requestId: string;
         resolve: (answer: RepositoryAnswer) => void;
         reject: (error: Error) => void;
+        onUpdate?: (event: RepositoryAnswerStreamEvent) => void;
       }
     | undefined;
   private token: string | undefined;
@@ -340,7 +343,25 @@ export class SidecarRuntime implements vscode.Disposable {
           if (control.success) {
             const message = control.data;
             if (message.sessionId !== options.sessionId) return;
-            if (message.type === "voice.answer") {
+            if (
+              message.type === "voice.answer.delta" ||
+              message.type === "voice.answer.progress" ||
+              message.type === "voice.answer.activity"
+            ) {
+              if (this.liveKitAnswer?.requestId === message.requestId) {
+                this.liveKitAnswer.onUpdate?.(
+                  message.type === "voice.answer.delta"
+                    ? { type: "delta", text: message.delta }
+                    : message.type === "voice.answer.activity"
+                      ? { type: "activity", activity: message.activity }
+                      : {
+                          type: "progress",
+                          stage: message.stage,
+                          text: message.message,
+                        },
+                );
+              }
+            } else if (message.type === "voice.answer") {
               if (this.liveKitAnswer?.requestId === message.requestId) {
                 this.liveKitAnswer.resolve(message.payload);
                 this.liveKitAnswer = undefined;
@@ -473,6 +494,7 @@ export class SidecarRuntime implements vscode.Disposable {
     question: string,
     provider: AgentProvider,
     workspacePath: string,
+    onUpdate?: (event: RepositoryAnswerStreamEvent) => void,
   ): Promise<RepositoryAnswer> {
     if (workspacePath !== this.liveKitWorkspacePath) {
       this.cancelLiveKitVoice();
@@ -491,7 +513,12 @@ export class SidecarRuntime implements vscode.Disposable {
     let timer: ReturnType<typeof setTimeout> | undefined;
     try {
       return await new Promise<RepositoryAnswer>((resolve, reject) => {
-        this.liveKitAnswer = { requestId, resolve, reject };
+        this.liveKitAnswer = {
+          requestId,
+          resolve,
+          reject,
+          ...(onUpdate ? { onUpdate } : {}),
+        };
         timer = setTimeout(() => {
           this.cancelLiveKitVoice();
         }, 180_000);
@@ -526,7 +553,15 @@ export class SidecarRuntime implements vscode.Disposable {
     workspacePath: string,
     question: string,
     provider: AgentProvider,
+    onUpdate?: (event: RepositoryAnswerStreamEvent) => void,
   ): Promise<RepositoryAnswer> {
+    if (onUpdate)
+      return await this.askRepositoryStream(
+        workspacePath,
+        question,
+        provider,
+        onUpdate,
+      );
     return await this.request(
       "/api/v1/repository/questions",
       {
@@ -536,6 +571,65 @@ export class SidecarRuntime implements vscode.Disposable {
       },
       repositoryAnswerSchema,
     );
+  }
+
+  private async askRepositoryStream(
+    workspacePath: string,
+    question: string,
+    provider: AgentProvider,
+    onUpdate: (event: RepositoryAnswerStreamEvent) => void,
+  ): Promise<RepositoryAnswer> {
+    await this.start();
+    const response = await fetch(
+      `http://127.0.0.1:${String(this.port)}/api/v1/repository/questions/stream`,
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${this.token ?? ""}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ workspacePath, question, provider }),
+        signal: AbortSignal.timeout(120_000),
+      },
+    );
+    if (!response.ok)
+      throw new Error(
+        `Repository streaming failed (${String(response.status)}).`,
+      );
+    if (!response.body)
+      throw new Error("Repository streaming returned no body.");
+    const reader = (
+      response.body as ReadableStream<Uint8Array<ArrayBuffer>>
+    ).getReader();
+    const decoder = new TextDecoder();
+    let pending = "";
+    let final: RepositoryAnswer | undefined;
+    const processLine = (line: string): void => {
+      if (!line.startsWith("data:")) return;
+      const event = repositoryAnswerStreamEventSchema.parse(
+        JSON.parse(line.slice(5).trim()),
+      );
+      if (event.type === "error") throw new Error(event.message);
+      if (event.type === "complete") final = event.answer;
+      else onUpdate(event);
+    };
+    try {
+      while (true) {
+        const { value, done } = await reader.read();
+        pending += decoder.decode(value, { stream: !done });
+        const lines = pending.split("\n");
+        pending = lines.pop() ?? "";
+        for (const line of lines) processLine(line);
+        if (done) break;
+      }
+      if (pending.trim()) processLine(pending);
+      if (!final)
+        throw new Error("Repository streaming ended without a final answer.");
+      return final;
+    } finally {
+      await reader.cancel();
+      reader.releaseLock();
+    }
   }
 
   async createFlowMap(

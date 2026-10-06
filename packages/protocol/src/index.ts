@@ -257,9 +257,57 @@ export const repositoryAnswerSchema = z.object({
 
 export type RepositoryAnswer = z.infer<typeof repositoryAnswerSchema>;
 
+export const repositoryActivitySchema = z.object({
+  id: z.string().min(1),
+  stage: z.string().min(1),
+  status: z.enum(["working", "completed"]),
+  message: z.string().min(1),
+  details: z.array(z.string()),
+});
+export type RepositoryActivity = z.infer<typeof repositoryActivitySchema>;
+
+export const repositoryAnswerStreamEventSchema = z.discriminatedUnion("type", [
+  z.object({ type: z.literal("activity"), activity: repositoryActivitySchema }),
+  z.object({
+    type: z.literal("progress"),
+    stage: z.string().nullable(),
+    text: z.string(),
+  }),
+  z.object({ type: z.literal("delta"), text: z.string() }),
+  z.object({
+    type: z.literal("passage"),
+    text: z.string(),
+    evidence: z.array(evidenceRangeSchema),
+  }),
+  z.object({ type: z.literal("complete"), answer: repositoryAnswerSchema }),
+  z.object({ type: z.literal("error"), message: z.string() }),
+]);
+export type RepositoryAnswerStreamEvent = z.infer<
+  typeof repositoryAnswerStreamEventSchema
+>;
+
 // Sidecar/extension-only controls. PCM audio is sent in binary WebSocket frames,
 // never exposed to the webview; acknowledgments come from the native device.
 export const liveKitServerControlSchema = z.discriminatedUnion("type", [
+  z.object({
+    type: z.literal("voice.answer.activity"),
+    sessionId: z.string().min(1),
+    requestId: z.string().min(1),
+    activity: repositoryActivitySchema,
+  }),
+  z.object({
+    type: z.literal("voice.answer.delta"),
+    sessionId: z.string().min(1),
+    requestId: z.string().min(1),
+    delta: z.string(),
+  }),
+  z.object({
+    type: z.literal("voice.answer.progress"),
+    sessionId: z.string().min(1),
+    requestId: z.string().min(1),
+    stage: z.string().nullable(),
+    message: z.string(),
+  }),
   z.object({
     type: z.literal("voice.answer"),
     sessionId: z.string().min(1),
@@ -1163,6 +1211,22 @@ export const extensionToWebviewMessageSchema = z.discriminatedUnion("type", [
     type: z.literal("repository.answer"),
     requestId: z.string().min(1),
     payload: repositoryAnswerSchema,
+  }),
+  z.object({
+    type: z.literal("repository.answer.delta"),
+    requestId: z.string().min(1),
+    delta: z.string(),
+  }),
+  z.object({
+    type: z.literal("repository.answer.progress"),
+    requestId: z.string().min(1),
+    stage: z.string().nullable(),
+    message: z.string(),
+  }),
+  z.object({
+    type: z.literal("repository.answer.activity"),
+    requestId: z.string().min(1),
+    activity: repositoryActivitySchema,
   }),
   z.object({
     type: z.literal("flow_map.opened"),

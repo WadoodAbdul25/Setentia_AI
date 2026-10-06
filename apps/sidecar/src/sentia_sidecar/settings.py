@@ -33,6 +33,13 @@ class Settings(BaseSettings):
         validation_alias=AliasChoices("SENTIA_CEREBRAS_URL", "CEREBRAS_URL"),
     )
     cerebras_model: str = "gpt-oss-120b"
+    voice_progress_phrases: bool = True
+    openai_eot_enabled: bool = True
+    openai_eot_model_id: str = "HuggingFaceTB/SmolLM2-360M-Instruct"
+    openai_eot_threshold: float = Field(default=0.03, ge=0, le=1, allow_inf_nan=False)
+    openai_eot_min_silence_ms: int = Field(default=600, ge=100, le=60_000)
+    openai_eot_inference_timeout_ms: int = Field(default=350, ge=1, le=60_000)
+    openai_eot_max_input_tokens: int = Field(default=2048, ge=1, le=8192)
 
     @field_validator("host")
     @classmethod

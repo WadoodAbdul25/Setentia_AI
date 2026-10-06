@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import copy
 import os
 import shutil
@@ -8,7 +9,7 @@ import tempfile
 import time
 from collections.abc import AsyncIterator
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 from uuid import uuid4
 
 import structlog
@@ -16,6 +17,18 @@ from openai_codex import ApprovalMode, AsyncCodex, AsyncThread, CodexConfig, San
 from openai_codex.types import JsonObject
 from pydantic import BaseModel, ValidationError
 
+from sentia_sidecar.answer_stream import (
+    AnswerEventCallback,
+    AnswerStreamAccumulator,
+    AnswerStreamEvent,
+    SDKActivityReporter,
+    TextSnapshotCallback,
+    emit_activity,
+    emit_progress,
+    emit_read_activity,
+    emit_selection_activity,
+    stream_answer_task,
+)
 from sentia_sidecar.feature_trace import (
     TRACE_SYSTEM_PROMPT,
     FeatureTraceEngine,
@@ -85,9 +98,19 @@ class CodexRepositoryService:
         self,
         question: str,
         manifest: RepositoryManifest,
+        *,
+        on_event: AnswerEventCallback | None = None,
     ) -> RepositoryAnswer:
         async with self._request_lock:
-            return await self._answer_locked(question, manifest)
+            return await self._answer_locked(question, manifest, on_event=on_event)
+
+    async def stream_answer(
+        self, question: str, manifest: RepositoryManifest
+    ) -> AsyncIterator[AnswerStreamEvent]:
+        async for event in stream_answer_task(
+            lambda emit: self.answer(question, manifest, on_event=emit)
+        ):
+            yield event
 
     async def select_flow_roots(
         self,
@@ -272,6 +295,8 @@ class CodexRepositoryService:
         self,
         question: str,
         manifest: RepositoryManifest,
+        *,
+        on_event: AnswerEventCallback | None = None,
     ) -> RepositoryAnswer:
         diagnostic_id = f"sentia_{uuid4().hex[:12]}"
         stage = "file_selection"
@@ -290,6 +315,14 @@ class CodexRepositoryService:
         )
 
         try:
+            await emit_activity(
+                on_event,
+                "repository",
+                f"Using the repository index of {manifest.files_scanned} files "
+                "to find relevant evidence.",
+                status="completed",
+            )
+            await emit_progress(on_event, "file_selection")
             codex, client_reused = await self._codex_client()
             selection_started = time.perf_counter()
             selection_result = await self._run_structured(
@@ -302,6 +335,7 @@ class CodexRepositoryService:
                     "selection report with a read mode and reason for each file."
                 ),
                 response_model=FileSelection,
+                activity=SDKActivityReporter(on_event, "Codex", stage) if on_event else None,
             )
             selection_elapsed_ms = _elapsed_ms(selection_started)
             selection = _parse_structured_result(
@@ -326,7 +360,10 @@ class CodexRepositoryService:
                 client_reused=client_reused,
             )
 
+            await emit_selection_activity(on_event, requested)
+
             stage = "content_read"
+            await emit_progress(on_event, stage)
             read_started = time.perf_counter()
             try:
                 async with asyncio.timeout(CONTENT_RETRIEVAL_TIMEOUT_SECONDS):
@@ -352,6 +389,7 @@ class CodexRepositoryService:
                 elapsed_ms=content_read_elapsed_ms,
                 timeout_seconds=CONTENT_RETRIEVAL_TIMEOUT_SECONDS,
             )
+            await emit_read_activity(on_event, repository)
 
             selection_report = "\n".join(
                 f"- {choice.path} ({choice.read_mode}): {choice.reason}"
@@ -359,6 +397,8 @@ class CodexRepositoryService:
                 if choice.path in manifest.files
             )
             stage = "repository_answer"
+            await emit_progress(on_event, stage)
+            accumulator = AnswerStreamAccumulator(repository, on_event) if on_event else None
             answer_started = time.perf_counter()
             answer_result = await self._run_structured(
                 codex,
@@ -376,6 +416,8 @@ class CodexRepositoryService:
                     "modeReason."
                 ),
                 response_model=ModelAnswer,
+                on_snapshot=accumulator.update if accumulator else None,
+                activity=SDKActivityReporter(on_event, "Codex", stage) if on_event else None,
             )
             answer_elapsed_ms = _elapsed_ms(answer_started)
             draft = _parse_structured_result(
@@ -399,6 +441,7 @@ class CodexRepositoryService:
             ) from error
 
         answer_text = draft.answer.strip()
+        await emit_progress(on_event, "validation")
         if not answer_text:
             raise RepositoryIntelligenceError(
                 f"Codex returned an empty repository answer. Diagnostic ID: {diagnostic_id}.",
@@ -433,6 +476,14 @@ class CodexRepositoryService:
             answer_elapsed_ms=answer_elapsed_ms,
             total_elapsed_ms=_elapsed_ms(total_started),
             client_reused=client_reused,
+        )
+        if accumulator is not None:
+            await accumulator.finish(result)
+        await emit_activity(
+            on_event,
+            "validation",
+            "Answer ready. Checked the file references against the supplied evidence.",
+            status="completed",
         )
         return result
 
@@ -723,6 +774,8 @@ class CodexRepositoryService:
         instructions: str,
         prompt: str,
         response_model: type[BaseModel],
+        on_snapshot: TextSnapshotCallback | None = None,
+        activity: SDKActivityReporter | None = None,
     ) -> TurnResult:
         thread = await self._start_structured_thread(
             codex,
@@ -732,6 +785,8 @@ class CodexRepositoryService:
             thread,
             prompt=prompt,
             response_model=response_model,
+            on_snapshot=on_snapshot,
+            activity=activity,
         )
 
     async def _start_structured_thread(
@@ -755,7 +810,13 @@ class CodexRepositoryService:
         *,
         prompt: str,
         response_model: type[BaseModel],
+        on_snapshot: TextSnapshotCallback | None = None,
+        activity: SDKActivityReporter | None = None,
     ) -> TurnResult:
+        if on_snapshot is not None or activity is not None:
+            return await self._run_structured_stream(
+                thread, prompt, response_model, on_snapshot, activity
+            )
         return await thread.run(
             prompt,
             approval_mode=ApprovalMode.deny_all,
@@ -763,6 +824,105 @@ class CodexRepositoryService:
             output_schema=_strict_output_schema(response_model),
             sandbox=Sandbox.read_only,
         )
+
+    async def _run_structured_stream(
+        self,
+        thread: AsyncThread,
+        prompt: str,
+        response_model: type[BaseModel],
+        on_snapshot: TextSnapshotCallback | None,
+        activity: SDKActivityReporter | None = None,
+    ) -> TurnResult:
+        turn = await thread.turn(
+            prompt,
+            approval_mode=ApprovalMode.deny_all,
+            model=self._requested_model,
+            output_schema=_strict_output_schema(response_model),
+            sandbox=Sandbox.read_only,
+        )
+        texts: dict[str, str] = {}
+        phases: dict[str, str | None] = {}
+        items: list[Any] = []
+        usage: Any = None
+        completed: Any = None
+        final_response: str | None = None
+        stream = turn.stream()
+        try:
+            async for notification in stream:
+                payload = notification.payload
+                if activity is not None:
+                    if notification.method == "turn/started":
+                        await activity.report("started")
+                    elif notification.method == "item/started":
+                        await activity.report("generating")
+                    elif notification.method == "item/agentMessage/delta":
+                        await activity.report("formatting")
+                if notification.method == "item/started":
+                    item = getattr(payload, "item", None)
+                    root = getattr(item, "root", item)
+                    phase = getattr(root, "phase", None)
+                    phases[str(getattr(root, "id", "answer"))] = getattr(phase, "value", phase)
+                elif notification.method == "item/agentMessage/delta":
+                    item_id = str(getattr(payload, "item_id", "answer"))
+                    delta = getattr(payload, "delta", None)
+                    if isinstance(delta, str):
+                        texts[item_id] = texts.get(item_id, "") + delta
+                        # Commentary/reasoning must never become the displayed answer.
+                        if (
+                            on_snapshot is not None
+                            and phases.get(item_id) in {None, "final_answer"}
+                            and texts[item_id].lstrip().startswith("{")
+                        ):
+                            await on_snapshot(texts[item_id])
+                elif notification.method == "item/completed":
+                    item = getattr(payload, "item", None)
+                    items.append(item)
+                    root = getattr(item, "root", item)
+                    text = getattr(root, "text", None)
+                    phase = getattr(root, "phase", None)
+                    if (
+                        isinstance(text, str)
+                        and getattr(phase, "value", phase)
+                        in {
+                            None,
+                            "final_answer",
+                        }
+                        and text.lstrip().startswith("{")
+                    ):
+                        final_response = text
+                        if on_snapshot is not None:
+                            await on_snapshot(text)
+                elif notification.method == "thread/tokenUsage/updated":
+                    usage = getattr(payload, "token_usage", None)
+                elif notification.method == "turn/completed":
+                    completed = getattr(payload, "turn", None)
+            if (
+                completed is None
+                or getattr(completed.status, "value", completed.status) != "completed"
+            ):
+                raise RepositoryIntelligenceError("Codex did not complete the streamed answer.")
+            if activity is not None:
+                await activity.report("finished")
+            return TurnResult(
+                id=turn.id,
+                status=completed.status,
+                error=completed.error,
+                started_at=getattr(completed, "started_at", None),
+                completed_at=getattr(completed, "completed_at", None),
+                duration_ms=getattr(completed, "duration_ms", None),
+                final_response=final_response,
+                items=items,
+                usage=usage,
+            )
+        except BaseException:
+            with contextlib.suppress(Exception):
+                async with asyncio.timeout(2):
+                    await turn.interrupt()
+            raise
+        finally:
+            close_stream = getattr(stream, "aclose", None)
+            if close_stream is not None:
+                await close_stream()
 
 
 def _parse_structured_result[ModelT: BaseModel](

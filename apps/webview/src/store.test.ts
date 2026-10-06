@@ -9,6 +9,10 @@ describe("Sentia webview store", () => {
       flowMapOpened: null,
       workspaceName: null,
       workspaceTrusted: false,
+      repositoryAnswer: null,
+      repositoryDraft: null,
+      requestError: null,
+      latestRepositoryRequestId: null,
     });
   });
 
@@ -64,5 +68,88 @@ describe("Sentia webview store", () => {
     expect(useSentiaStore.getState().workspaceName).toBe("fixture");
     expect(useSentiaStore.getState().sidecar.status).toBe("healthy");
     expect(useSentiaStore.getState().agent.selectedProvider).toBe("codex");
+  });
+
+  it("accumulates draft text and ignores stale request updates", () => {
+    const store = useSentiaStore.getState();
+    store.beginRepositoryRequest("new");
+    store.appendRepositoryDelta("new", "First ");
+    store.appendRepositoryDelta("old", "stale");
+    store.setRepositoryProgress("new", "Searching the files.");
+    store.setRepositoryProgress("old", "stale stage");
+    store.appendRepositoryDelta("new", "paragraph.");
+    expect(useSentiaStore.getState().repositoryDraft).toEqual({
+      requestId: "new",
+      text: "First paragraph.",
+      message: "Searching the files.",
+      failed: false,
+      activities: [],
+    });
+  });
+
+  it("keeps interrupted drafts visibly incomplete and ignores further deltas", () => {
+    const store = useSentiaStore.getState();
+    store.beginRepositoryRequest("request");
+    store.appendRepositoryDelta("request", "Partial answer.");
+    store.setRequestError("request", "Connection lost");
+    store.appendRepositoryDelta("request", "late text");
+    expect(useSentiaStore.getState().repositoryDraft?.text).toBe(
+      "Partial answer.",
+    );
+    expect(useSentiaStore.getState().repositoryDraft?.failed).toBe(true);
+  });
+
+  it("does not let an older request error replace the active draft", () => {
+    const store = useSentiaStore.getState();
+    store.beginRepositoryRequest("active");
+    store.appendRepositoryDelta("active", "Current answer");
+    store.setRequestError("old", "Stale error");
+    expect(useSentiaStore.getState().requestError).toBeNull();
+    expect(useSentiaStore.getState().repositoryDraft?.failed).toBe(false);
+  });
+
+  it("updates work-log entries in place and ignores stale and post-final activity", () => {
+    const store = useSentiaStore.getState();
+    const entry = {
+      id: "file_selection",
+      stage: "file_selection",
+      status: "working" as const,
+      message: "Choosing relevant files.",
+      details: [],
+    };
+    store.beginRepositoryRequest("active");
+    store.setRepositoryActivity("active", entry);
+    store.setRepositoryActivity("old", { ...entry, message: "Stale" });
+    store.setRepositoryActivity("active", {
+      ...entry,
+      status: "completed",
+      message: "Selected 8 files.",
+      details: ["src/main.py"],
+    });
+    expect(useSentiaStore.getState().repositoryDraft?.activities).toEqual([
+      {
+        ...entry,
+        status: "completed",
+        message: "Selected 8 files.",
+        details: ["src/main.py"],
+      },
+    ]);
+    const answer = {
+      answer: "Final answer",
+      spokenAnswer: "Final answer",
+      evidence: [],
+      recommendedMode: "brainstorm" as const,
+      modeReason: "Explanation",
+      model: "fixture",
+      filesScanned: 8,
+      filesRead: 8,
+      selectedFiles: [],
+      usage: { inputTokens: 1, outputTokens: 1 },
+    };
+    store.setRepositoryAnswer("active", answer);
+    store.setRepositoryActivity("active", entry);
+    store.appendRepositoryDelta("active", "late draft");
+    expect(useSentiaStore.getState().repositoryDraft).toBeNull();
+    expect(useSentiaStore.getState().repositoryAnswer?.payload).toEqual(answer);
   });
 });

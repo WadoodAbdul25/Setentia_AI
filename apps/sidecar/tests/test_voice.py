@@ -122,6 +122,92 @@ async def test_openai_local_silence_detection_commits_without_server_vad() -> No
     assert socket.closed is True
 
 
+async def test_openai_default_commits_after_one_and_a_half_seconds_without_speech() -> None:
+    socket = FakeOpenAISocket([json.dumps({"type": "session.updated"})])
+    connection = OpenAIRealtimeTranscriptionConnection(socket)  # type: ignore[arg-type]
+    await connection.configure(OpenAIVoiceOptions(), ())
+    assert connection.silence_duration_seconds == 1.5
+    try:
+        await connection.send_audio((1_000).to_bytes(2, "little", signed=True) * 2_400)
+        assert connection.last_speech_at is not None
+        # Advance the elapsed silence without a real 1.5-second test sleep.
+        connection.last_speech_at -= 1.5
+        assert connection.endpoint_task is not None
+        await asyncio.wait_for(connection.endpoint_task, timeout=0.2)
+
+        commits = [
+            json.loads(message)
+            for message in socket.sent
+            if json.loads(message).get("type") == "input_audio_buffer.commit"
+        ]
+        assert len(commits) == 1
+    finally:
+        await connection.close()
+
+
+async def test_openai_silence_does_not_submit_before_any_speech() -> None:
+    socket = FakeOpenAISocket([json.dumps({"type": "session.updated"})])
+    connection = OpenAIRealtimeTranscriptionConnection(socket)  # type: ignore[arg-type]
+    await connection.configure(OpenAIVoiceOptions(), ())
+    try:
+        await connection.send_audio(b"\x00\x00" * 2_400)
+        assert connection.last_speech_at is None
+        assert connection.endpoint_task is None
+        assert not connection.commit_in_flight
+    finally:
+        await connection.close()
+
+
+async def test_openai_only_speech_audio_restarts_the_silence_timer() -> None:
+    socket = FakeOpenAISocket([json.dumps({"type": "session.updated"})])
+    connection = OpenAIRealtimeTranscriptionConnection(socket)  # type: ignore[arg-type]
+    await connection.configure(OpenAIVoiceOptions(), ())
+    try:
+        speech = (1_000).to_bytes(2, "little", signed=True) * 2_400
+        await connection.send_audio(speech)
+        assert connection.last_speech_at is not None
+        connection.last_speech_at -= 1.4
+        previous_speech_at = connection.last_speech_at
+
+        await connection.send_audio((100).to_bytes(2, "little", signed=True) * 2_400)
+        assert connection.last_speech_at == previous_speech_at
+
+        await connection.send_audio(speech)
+        assert connection.last_speech_at > previous_speech_at
+        assert not connection.commit_in_flight
+    finally:
+        await connection.close()
+
+
+async def test_late_openai_transcript_updates_do_not_extend_acoustic_silence() -> None:
+    socket = FakeOpenAISocket(
+        [
+            json.dumps({"type": "session.updated"}),
+            json.dumps(
+                {
+                    "type": "conversation.item.input_audio_transcription.delta",
+                    "item_id": "item-delayed",
+                    "delta": "read the code",
+                }
+            ),
+        ]
+    )
+    connection = OpenAIRealtimeTranscriptionConnection(socket)  # type: ignore[arg-type]
+    await connection.configure(OpenAIVoiceOptions(), ())
+    try:
+        await connection.send_audio((1_000).to_bytes(2, "little", signed=True) * 2_400)
+        assert connection.last_speech_at is not None
+        connection.last_speech_at -= 1.4
+        last_speech_at = connection.last_speech_at
+
+        messages = [message async for message in connection.messages()]
+
+        assert messages[0]["transcript"] == "read the code"
+        assert connection.last_speech_at == last_speech_at
+    finally:
+        await connection.close()
+
+
 async def test_openai_completed_turn_closes_without_duplicate_commit() -> None:
     socket = FakeOpenAISocket(
         [
@@ -267,6 +353,12 @@ def test_flux_url_declares_raw_linear16_audio() -> None:
 
     assert "encoding=linear16" in url
     assert "sample_rate=16000" in url
+    assert "eot_timeout_ms=1500" in url
+
+
+def test_both_providers_default_to_one_and_a_half_seconds_of_silence() -> None:
+    assert VoiceOptions().eot_timeout_ms == 1_500
+    assert OpenAIVoiceOptions().silence_duration_ms == 1_500
 
 
 def test_openai_url_opens_gpt_realtime_session() -> None:
@@ -405,9 +497,16 @@ def test_openai_voice_route_does_not_enter_deepgram_pipeline(
     (tmp_path / "sample.py").write_text("def sample():\n    return True\n", encoding="utf-8")
     deepgram_gateway = FakeFluxGateway()
     openai_gateway = FakeOpenAIGateway()
+    configured = settings.model_copy(
+        update={
+            "openai_eot_threshold": 0.08,
+            "openai_eot_min_silence_ms": 750,
+            "openai_eot_inference_timeout_ms": 250,
+        }
+    )
     with TestClient(
         create_app(
-            settings,
+            configured,
             flux_gateway=deepgram_gateway,
             openai_voice_gateway=openai_gateway,
         )
@@ -434,5 +533,8 @@ def test_openai_voice_route_does_not_enter_deepgram_pipeline(
 
     assert openai_gateway.options is not None
     assert openai_gateway.options.model == "gpt-live-transcribe"
+    assert openai_gateway.options.eot_threshold == 0.08
+    assert openai_gateway.options.semantic_silence_ms == 750
+    assert openai_gateway.options.eot_inference_timeout_ms == 250
     assert deepgram_gateway.options is None
     assert openai_gateway.connection.closed is True

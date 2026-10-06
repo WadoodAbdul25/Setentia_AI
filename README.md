@@ -391,13 +391,32 @@ for the running sidecar. The webview never receives these keys. Cerebras receive
 the question and the repository-derived written answer, but no coding tools.
 
 Select **OpenAI** under **Voice provider** and record/send a question normally.
-The full written answer and evidence appear before speech. Narration streams
+The answer panel shows a live English work log while Claude/Codex works: choosing
+files, reading evidence (including shortened excerpts or omitted files), drafting,
+and checking references. Each provider consumes its own SDK's native streaming
+events; Sentia never displays raw terminal JSON or private reasoning. Choose
+Markdown or the read-only Tiptap view using the answer panel's view buttons.
+The validated final answer replaces the entire temporary log, with final evidence,
+token usage, and mode recommendations. Late updates cannot overwrite that result.
+Complete passages with source references checked against the supplied code can
+still start Cerebras narration before the whole answer is finished. Narration streams
 through OpenAI TTS, with "Sentia" pronounced "Sen-shia". Capture still ends per
 question: persistent mic and intelligent interruption are not enabled in this
 phase. Deepgram and typed questions retain their existing paths.
 
 Set `sentia.voice.openaiPipeline` to `native` to use the original flow below.
 That path requires the OpenAI key in SecretStorage for extension-side TTS.
+
+The LiveKit voice path adds up to two short progress phrases per question, such
+as “Checking” or “Let me look that up for you.” Subsequent phrases correspond to
+actual file-selection, code-reading, or validation stages, with a 12-second
+cooldown; “Almost done” is not triggered by a guess about elapsed time. Progress
+speech never overlaps answer speech and is skipped once answer passages are ready.
+Set `SENTIA_VOICE_PROGRESS_PHRASES=false` in the sidecar environment to disable it.
+This first streaming-speech implementation targets OpenAI/LiveKit; native OpenAI
+and Deepgram retain their completed-answer speech path, while English work logs
+stream for both Claude and Codex. No 60-second total playback cutoff remains in
+the LiveKit output adapter; provider timeouts still apply.
 
 For a small paid provider check without microphone/speaker access or repository
 data, run `.venv/bin/python scripts/check-livekit-voice.py`. It checks STT
@@ -419,13 +438,42 @@ repository answer, and
 `gpt-4o-mini-tts` speaks the faithful speech rendering of that same answer.
 The full answer and evidence remain visible. The default voice is `marin`; use
 `sentia.voice.openaiVoice` to change it. Sentia labels the output as
-AI-generated in the interface. Deepgram Flux and Sentia's OpenAI endpoint detector both queue
-a detected end-of-turn for voice submission after a two-second safety window;
-choose **Cancel** to discard it or **Send now** to submit immediately. Because
+AI-generated in the interface. Detected end-of-turn transcripts are submitted
+without an additional interface delay. Deepgram Flux uses a 1.5-second silence
+timeout as its end-of-turn fallback. Because
 `gpt-live-transcribe` does not accept turn detection in this session, Sentia keeps
-OpenAI turn detection disabled and locally commits the audio after five seconds
-without speech. This gives developers room to pause while thinking. Choosing
+OpenAI server turn detection disabled. A local SmolLM2 completion scorer checks
+stable transcript text after 600 ms without detected speech; a score at or above
+0.03 can commit the turn early. The 1.5-second silence deadline remains the
+fallback for incomplete text, delayed transcription, slow inference, or model
+failure. Late transcript updates do not restart that deadline; new speech does,
+and invalidates any in-flight completion decision. Final transcription and answer
+generation still take time. Choosing
 **Stop** still commits the current recording immediately for either provider.
+
+The same detector is used by the native and LiveKit/Cerebras OpenAI paths.
+Weights load once in a background worker on the first OpenAI connection, using
+CUDA, Apple MPS, or CPU as available. The first run may download the public
+`HuggingFaceTB/SmolLM2-360M-Instruct` weights; silence-only fallback remains active
+while loading. No transcript text is logged by the detector.
+
+Optional sidecar settings in `apps/sidecar/.env`:
+
+```dotenv
+SENTIA_OPENAI_EOT_ENABLED=true
+SENTIA_OPENAI_EOT_THRESHOLD=0.03
+SENTIA_OPENAI_EOT_MIN_SILENCE_MS=600
+SENTIA_OPENAI_EOT_INFERENCE_TIMEOUT_MS=350
+SENTIA_OPENAI_EOT_MAX_INPUT_TOKENS=2048
+```
+
+`SENTIA_OPENAI_EOT_MODEL_ID` can select a local directory containing compatible
+SmolLM2 weights. The score is not calibrated speech confidence: validate the
+threshold on real complete/unfinished questions before tuning it aggressively.
+Per-connection turn resets preserve bounded user/assistant context and leave
+the OpenAI socket open until Stop/end-session. This is backend groundwork only;
+the current UI still ends capture per question. Persistent mic, echo handling,
+and intelligent interruption are not enabled yet.
 
 ## Coding-agent SDK setup
 
